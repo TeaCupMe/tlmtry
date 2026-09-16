@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tlmtry-collector"
+version = "1.0.0"
+description = "RS-485 telemetry collector with SQLite storage and backup replication"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "pyserial>=3.5",
+  "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+tlmtry-collector = "tlmtry_collector.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["tlmtry_collector*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,23 @@
+[Unit]
+Description=Tlmtry RS-485 telemetry collector
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=tlmtry
+Group=dialout
+WorkingDirectory=/var/lib/tlmtry
+ExecStart=/usr/bin/tlmtry-collector run --config /etc/tlmtry/collector.yaml
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+# Hardening (adjust if your paths differ)
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/tlmtry
+ReadOnlyPaths=/etc/tlmtry
+
+[Install]
+WantedBy=multi-user.target
