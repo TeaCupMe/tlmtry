@@ -1,0 +1,21 @@
+# Example collector configuration
+port: /dev/ttyUSB0
+baudrate: 115200
+database: /var/lib/tlmtry/primary.db
+
+response_timeout_ms: 200
+rediscover_every_s: 300
+address_min: 1
+address_max: 100
+use_broadcast: true
+
+# Optional per-address poll interval overrides (milliseconds)
+# interval_overrides:
+#   1: 1000
+#   2: 5000
+
+# Optional background replication when backup media is present
+# backup_path: /media/backup/tlmtry-backup.db
+# replicate_every_s: 3600
+
+log_level: INFO
