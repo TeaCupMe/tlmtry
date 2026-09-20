@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tlmtry-collector"
 version = "1.0.0"
-description = "RS-485 telemetry collector with SQLite storage and backup replication"
+description = "RS-485 telemetry collector with SQLite/PostgreSQL storage and backup replication"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -14,7 +14,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+postgres = ["psycopg[binary]>=3.1"]
+dev = ["pytest>=8.0", "psycopg[binary]>=3.1"]
 
 [project.scripts]
 tlmtry-collector = "tlmtry_collector.__main__:main"

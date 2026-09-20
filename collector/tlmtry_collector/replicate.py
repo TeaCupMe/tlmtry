@@ -1,4 +1,4 @@
-"""Incremental replication from primary SQLite DB to a backup DB file."""
+"""Incremental replication from primary DB to a backup SQLite file."""
 
 from __future__ import annotations
 
@@ -17,29 +17,20 @@ def replicate(primary: Storage, backup_path: str | Path) -> dict[str, int]:
     Copy device/metric metadata and new samples to backup_path.
 
     Uses primary replication_state watermark `samples_id`. Safe to call when
-    backup media is only occasionally available.
+    backup media is only occasionally available. Destination is always SQLite
+    (portable file for USB/offline backup), regardless of primary backend.
     """
     backup_path = Path(backup_path)
     backup_path.parent.mkdir(parents=True, exist_ok=True)
 
     watermark = primary.get_replication_watermark()
     rows = primary.iter_samples_after(watermark)
+    devices = primary.list_devices()
+    metrics = primary.list_metrics()
 
     bconn = sqlite3.connect(backup_path)
     try:
         bconn.executescript(SCHEMA)
-        # Sync device + metric catalogs from primary
-        devices = primary.connection().execute(
-            """
-            SELECT address, device_id, name, fw_major, fw_minor,
-                   poll_interval_ms, last_seen, online, last_error
-            FROM devices
-            """
-        ).fetchall()
-        metrics = primary.connection().execute(
-            "SELECT address, metric_id, name, type, unit FROM metrics"
-        ).fetchall()
-
         with bconn:
             for d in devices:
                 bconn.execute(
@@ -58,7 +49,17 @@ def replicate(primary: Storage, backup_path: str | Path) -> dict[str, int]:
                         online=excluded.online,
                         last_error=excluded.last_error
                     """,
-                    tuple(d),
+                    (
+                        d.address,
+                        d.device_id,
+                        d.name,
+                        d.fw_major,
+                        d.fw_minor,
+                        d.poll_interval_ms,
+                        d.last_seen,
+                        1 if d.online else 0,
+                        d.last_error,
+                    ),
                 )
             for m in metrics:
                 bconn.execute(
@@ -70,11 +71,10 @@ def replicate(primary: Storage, backup_path: str | Path) -> dict[str, int]:
                         type=excluded.type,
                         unit=excluded.unit
                     """,
-                    tuple(m),
+                    (m.address, m.metric_id, m.name, m.type, m.unit),
                 )
 
             max_id = watermark
-            copied = 0
             for r in rows:
                 bconn.execute(
                     """
@@ -83,18 +83,17 @@ def replicate(primary: Storage, backup_path: str | Path) -> dict[str, int]:
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        r["id"],
-                        r["address"],
-                        r["metric_id"],
-                        r["ts"],
-                        r["value_real"],
-                        r["value_text"],
-                        r["type"],
-                        r["quality"],
+                        r.id,
+                        r.address,
+                        r.metric_id,
+                        r.ts,
+                        r.value_real,
+                        r.value_text,
+                        r.type,
+                        r.quality,
                     ),
                 )
-                max_id = max(max_id, int(r["id"]))
-                copied += 1
+                max_id = max(max_id, int(r.id))
 
             bconn.execute(
                 """
@@ -112,7 +111,12 @@ def replicate(primary: Storage, backup_path: str | Path) -> dict[str, int]:
             "watermark_before": watermark,
             "watermark_after": primary.get_replication_watermark(),
         }
-        log.info("replication complete: %s -> %s (%s)", primary.path, backup_path, result)
+        log.info(
+            "replication complete: %s -> %s (%s)",
+            primary.location,
+            backup_path,
+            result,
+        )
         return result
     finally:
         bconn.close()

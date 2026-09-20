@@ -155,7 +155,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     storage = Storage(args.database or cfg.database)
     try:
         devices = storage.list_devices()
-        print(f"database: {storage.path}")
+        print(f"database: {storage.location} ({storage.backend})")
         print(f"devices: {len(devices)}")
         print(f"samples: {storage.sample_count()}")
         print(f"replication watermark: {storage.get_replication_watermark()}")
@@ -177,23 +177,35 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run", help="Run collector loop (foreground; use systemd for service)")
     run.add_argument("--sim", action="store_true", help="Use in-process fake RS-485 devices")
-    run.add_argument("--database", help="Override primary database path")
+    run.add_argument(
+        "--database",
+        help="Override primary DB: SQLite path or postgres:// / postgresql:// URL",
+    )
     run.set_defaults(func=cmd_run)
 
     disc = sub.add_parser("discover", help="Scan bus and print/store manifests")
     disc.add_argument("--port", help="Override serial port")
     disc.add_argument("--max-address", type=int, default=None)
-    disc.add_argument("--database", help="Override primary database path")
+    disc.add_argument(
+        "--database",
+        help="Override primary DB: SQLite path or postgres:// / postgresql:// URL",
+    )
     disc.add_argument("--sim", action="store_true", help="Use in-process fake RS-485 devices")
     disc.set_defaults(func=cmd_discover)
 
-    rep = sub.add_parser("replicate", help="Copy new samples to backup database")
+    rep = sub.add_parser("replicate", help="Copy new samples to backup SQLite file")
     rep.add_argument("--to", help="Backup SQLite path")
-    rep.add_argument("--database", help="Primary database path")
+    rep.add_argument(
+        "--database",
+        help="Primary DB: SQLite path or postgres:// / postgresql:// URL",
+    )
     rep.set_defaults(func=cmd_replicate)
 
     st = sub.add_parser("status", help="Show devices and sample counts")
-    st.add_argument("--database", help="Primary database path")
+    st.add_argument(
+        "--database",
+        help="Primary DB: SQLite path or postgres:// / postgresql:// URL",
+    )
     st.set_defaults(func=cmd_status)
 
     return p

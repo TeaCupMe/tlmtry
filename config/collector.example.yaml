@@ -1,7 +1,10 @@
 # Example collector configuration
 port: /dev/ttyUSB0
 baudrate: 115200
+
+# Primary database: SQLite file path (default) or PostgreSQL URL
 database: /var/lib/tlmtry/primary.db
+# database: postgresql://tlmtry:CHANGE_ME@127.0.0.1:5432/tlmtry
 
 response_timeout_ms: 200
 rediscover_every_s: 300
@@ -14,7 +17,8 @@ use_broadcast: true
 #   1: 1000
 #   2: 5000
 
-# Optional background replication when backup media is present
+# Optional background replication to a portable SQLite backup file
+# (works with both SQLite and PostgreSQL primary)
 # backup_path: /media/backup/tlmtry-backup.db
 # replicate_every_s: 3600
 

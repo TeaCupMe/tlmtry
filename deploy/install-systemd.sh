@@ -17,9 +17,10 @@ mkdir -p /var/lib/tlmtry /etc/tlmtry "$PREFIX"
 rsync -a --delete "$ROOT/" "$PREFIX/" --exclude .git --exclude '**/__pycache__' --exclude .venv
 
 python3 -m pip install -e "$PREFIX/collector"
+# For PostgreSQL primary: python3 -m pip install -e "$PREFIX/collector[postgres]"
 if [[ ! -f /etc/tlmtry/collector.yaml ]]; then
   cp "$PREFIX/config/collector.example.yaml" /etc/tlmtry/collector.yaml
-  echo "Created /etc/tlmtry/collector.yaml — edit serial port before starting."
+  echo "Created /etc/tlmtry/collector.yaml — edit serial port (and database) before starting."
 fi
 
 cp "$PREFIX/deploy/tlmtry-collector.service" /etc/systemd/system/
