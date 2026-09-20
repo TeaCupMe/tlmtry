@@ -13,6 +13,7 @@ import yaml
 class AppConfig:
     port: str = "/dev/ttyUSB0"
     baudrate: int = 115200
+    # SQLite file path, or postgres:// / postgresql:// URL
     database: str = "data/primary.db"
     response_timeout_ms: int = 200
     rediscover_every_s: float = 300.0
@@ -20,7 +21,7 @@ class AppConfig:
     address_max: int = 100
     use_broadcast: bool = True
     interval_overrides: dict[int, int] = field(default_factory=dict)
-    backup_path: str | None = None
+    backup_path: str | None = None  # SQLite path or postgres:// URL
     replicate_every_s: float | None = None
     log_level: str = "INFO"
 
