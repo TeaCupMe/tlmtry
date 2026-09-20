@@ -3,7 +3,7 @@
 Система сбора телеметрии с устройств Arduino по RS-485 для изоляционного лабораторного эксперимента.
 
 - **Arduino-библиотека** `Tlmtry` — регистрация датчиков, discovery, ответы на опрос
-- **ПК-сборщик** `tlmtry-collector` — периодический опрос, SQLite или PostgreSQL, репликация в резервную SQLite
+- **ПК-сборщик** `tlmtry-collector` — периодический опрос, SQLite или PostgreSQL, репликация в резервную SQLite/PostgreSQL
 - **Автозапуск** через systemd (Linux) или Task Scheduler (Windows)
 - До **100** устройств, у каждого своя периодичность опроса
 
@@ -11,7 +11,7 @@
 
 ```
 Arduino nodes (RS-485)  <-->  USB-RS485  <-->  tlmtry-collector  -->  primary (SQLite | PostgreSQL)
-                                                              \-->  backup.db (по команде / по таймеру)
+                                                              \-->  backup (SQLite | PostgreSQL)
 ```
 
 Устройства сами сообщают манифест (метрики + желаемый интервал) по команде `DISCOVER`.
@@ -41,9 +41,14 @@ pip install -e ".[postgres]"
 # создайте БД и пользователя, затем:
 tlmtry-collector run --sim \
   --database 'postgresql://tlmtry:secret@127.0.0.1:5432/tlmtry'
+
+# репликация primary → backup (оба могут быть Postgres или SQLite в любой комбинации):
+tlmtry-collector replicate \
+  --database 'postgresql://tlmtry:secret@127.0.0.1:5432/tlmtry' \
+  --to 'postgresql://tlmtry:secret@127.0.0.1:5432/tlmtry_backup'
 ```
 
-В YAML то же поле `database` принимает либо путь к файлу SQLite, либо URL `postgres://` / `postgresql://`. Резервная копия (`backup_path` / `replicate --to`) всегда пишется в файл SQLite.
+В YAML поля `database` и `backup_path` принимают либо путь к файлу SQLite, либо URL `postgres://` / `postgresql://`.
 
 С реальным адаптером скопируйте [config/collector.example.yaml](config/collector.example.yaml), укажите `port` и:
 
@@ -92,7 +97,7 @@ device.setPollIntervalMs(2000);
 | `run` | Основной цикл сбора (для systemd) |
 | `run --sim` | То же со встроенным симулятором шины |
 | `discover` | Разовое сканирование устройств |
-| `replicate --to PATH` | Инкрементальная выгрузка в резервную SQLite |
+| `replicate --to PATH_OR_URL` | Инкрементальная выгрузка в резервную SQLite или PostgreSQL |
 | `status` | Устройства и число сэмплов |
 
 ## Тесты

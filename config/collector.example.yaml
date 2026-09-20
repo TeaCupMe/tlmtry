@@ -17,9 +17,9 @@ use_broadcast: true
 #   1: 1000
 #   2: 5000
 
-# Optional background replication to a portable SQLite backup file
-# (works with both SQLite and PostgreSQL primary)
+# Optional background replication target: SQLite file or PostgreSQL URL
 # backup_path: /media/backup/tlmtry-backup.db
+# backup_path: postgresql://tlmtry:CHANGE_ME@127.0.0.1:5432/tlmtry_backup
 # replicate_every_s: 3600
 
 log_level: INFO

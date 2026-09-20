@@ -438,6 +438,104 @@ class Storage:
             for r in rows
         ]
 
+    def apply_replication(
+        self,
+        devices: list[DeviceRow],
+        metrics: list[MetricCatalogRow],
+        samples: list[SampleRow],
+        *,
+        replicated_at: float | None = None,
+    ) -> None:
+        """Upsert catalog rows and insert samples by explicit id (idempotent)."""
+        stamp = replicated_at if replicated_at is not None else time.time()
+        sample_sql = (
+            """
+            INSERT INTO samples(
+                id, address, metric_id, ts, value_real, value_text, type, quality
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO NOTHING
+            """
+            if self.backend == "postgres"
+            else """
+            INSERT OR IGNORE INTO samples(
+                id, address, metric_id, ts, value_real, value_text, type, quality
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """
+        )
+        with self.transaction():
+            for d in devices:
+                self._execute(
+                    """
+                    INSERT INTO devices(
+                        address, device_id, name, fw_major, fw_minor,
+                        poll_interval_ms, last_seen, online, last_error
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(address) DO UPDATE SET
+                        device_id=excluded.device_id,
+                        name=excluded.name,
+                        fw_major=excluded.fw_major,
+                        fw_minor=excluded.fw_minor,
+                        poll_interval_ms=excluded.poll_interval_ms,
+                        last_seen=excluded.last_seen,
+                        online=excluded.online,
+                        last_error=excluded.last_error
+                    """,
+                    (
+                        d.address,
+                        d.device_id,
+                        d.name,
+                        d.fw_major,
+                        d.fw_minor,
+                        d.poll_interval_ms,
+                        d.last_seen,
+                        1 if d.online else 0,
+                        d.last_error,
+                    ),
+                )
+            for m in metrics:
+                self._execute(
+                    """
+                    INSERT INTO metrics(address, metric_id, name, type, unit)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(address, metric_id) DO UPDATE SET
+                        name=excluded.name,
+                        type=excluded.type,
+                        unit=excluded.unit
+                    """,
+                    (m.address, m.metric_id, m.name, m.type, m.unit),
+                )
+            for r in samples:
+                self._execute(
+                    sample_sql,
+                    (
+                        r.id,
+                        r.address,
+                        r.metric_id,
+                        r.ts,
+                        r.value_real,
+                        r.value_text,
+                        r.type,
+                        r.quality,
+                    ),
+                )
+            if samples and self.backend == "postgres":
+                # Keep BIGSERIAL in sync after explicit id inserts.
+                self._fetchone(
+                    """
+                    SELECT setval(
+                        pg_get_serial_sequence('samples', 'id'),
+                        COALESCE((SELECT MAX(id) FROM samples), 1)
+                    ) AS v
+                    """
+                )
+            self._execute(
+                """
+                INSERT INTO replication_state(key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                """,
+                ("last_replicate_ts", str(stamp)),
+            )
+
     def connection(self) -> Any:
         """Return the raw DB-API connection (sqlite3 or psycopg)."""
         return self._conn

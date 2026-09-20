@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from .config import load_config
-from .replicate import replicate
+from .replicate import backup_ready, replicate
 from .scheduler import CollectorScheduler, SchedulerConfig
 from .serial_bus import Bus, SerialTransport
 from .storage import Storage
@@ -78,13 +78,16 @@ def cmd_run(args: argparse.Namespace) -> int:
         def _repl_loop() -> None:
             log = logging.getLogger("tlmtry.replicate")
             while not stop.wait(cfg.replicate_every_s):
-                path = Path(cfg.backup_path)
+                dest = cfg.backup_path
                 try:
-                    # Only replicate if parent exists (USB mounted, etc.)
-                    if not path.parent.exists():
-                        log.debug("backup parent missing, skip: %s", path.parent)
+                    # SQLite USB mounts: skip when parent path is absent.
+                    if not backup_ready(dest):
+                        log.debug(
+                            "backup parent missing, skip: %s",
+                            Path(dest).parent,
+                        )
                         continue
-                    replicate(storage, path)
+                    replicate(storage, dest)
                 except Exception:
                     log.exception("background replication failed")
 
@@ -140,7 +143,11 @@ def cmd_replicate(args: argparse.Namespace) -> int:
     primary = Storage(args.database or cfg.database)
     dest = args.to or cfg.backup_path
     if not dest:
-        print("backup path required: --to or config backup_path", file=sys.stderr)
+        print(
+            "backup target required: --to or config backup_path "
+            "(SQLite path or postgres:// URL)",
+            file=sys.stderr,
+        )
         return 2
     try:
         result = replicate(primary, dest)
@@ -193,8 +200,11 @@ def build_parser() -> argparse.ArgumentParser:
     disc.add_argument("--sim", action="store_true", help="Use in-process fake RS-485 devices")
     disc.set_defaults(func=cmd_discover)
 
-    rep = sub.add_parser("replicate", help="Copy new samples to backup SQLite file")
-    rep.add_argument("--to", help="Backup SQLite path")
+    rep = sub.add_parser(
+        "replicate",
+        help="Copy new samples to backup SQLite file or PostgreSQL URL",
+    )
+    rep.add_argument("--to", help="Backup SQLite path or postgres:// / postgresql:// URL")
     rep.add_argument(
         "--database",
         help="Primary DB: SQLite path or postgres:// / postgresql:// URL",
