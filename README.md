@@ -50,7 +50,9 @@ tlmtry-collector replicate \
 
 В YAML поля `database` и `backup_path` принимают либо путь к файлу SQLite, либо URL `postgres://` / `postgresql://`.
 
-Чтение данных из PostgreSQL на Python (Storage API + SQL): [examples/read_telemetry_postgres.py](examples/read_telemetry_postgres.py).
+Чтение данных из PostgreSQL на Python:
+- Storage API + SQL: [examples/read_telemetry_postgres.py](examples/read_telemetry_postgres.py)
+- SQLAlchemy ORM: [examples/read_telemetry_sqlalchemy.py](examples/read_telemetry_sqlalchemy.py)
 
 С реальным адаптером скопируйте [config/collector.example.yaml](config/collector.example.yaml), укажите `port` и:
 
