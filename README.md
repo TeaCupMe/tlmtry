@@ -36,16 +36,31 @@ tlmtry-collector replicate --database /tmp/tlmtry-primary.db --to /tmp/tlmtry-ba
 
 ### PostgreSQL
 
+Контейнер с базой и псевдо-данными:
+
+```bash
+bash scripts/up_postgres.sh
+```
+
+Скрипт запускает контейнер `tlmtry-postgres` (образ `postgres:16`, порт `5432`, пользователь, пароль и база `tlmtry`) и записывает в него телеметрию. Повторный запуск поднимает тот же контейнер и заново заполняет таблицы. Лишние аргументы передаются в заполнение, например `bash scripts/up_postgres.sh --hours 6`.
+
+```
+postgresql://tlmtry:tlmtry@127.0.0.1:5432/tlmtry
+```
+
+Остановить контейнер: `docker stop tlmtry-postgres`.
+
+Сборщик к уже запущенной базе:
+
 ```bash
 pip install -e ".[postgres]"
-# создайте БД и пользователя, затем:
 tlmtry-collector run --sim \
-  --database 'postgresql://tlmtry:secret@127.0.0.1:5432/tlmtry'
+  --database 'postgresql://tlmtry:tlmtry@127.0.0.1:5432/tlmtry'
 
 # репликация primary → backup (оба могут быть Postgres или SQLite в любой комбинации):
 tlmtry-collector replicate \
-  --database 'postgresql://tlmtry:secret@127.0.0.1:5432/tlmtry' \
-  --to 'postgresql://tlmtry:secret@127.0.0.1:5432/tlmtry_backup'
+  --database 'postgresql://tlmtry:tlmtry@127.0.0.1:5432/tlmtry' \
+  --to 'postgresql://tlmtry:tlmtry@127.0.0.1:5432/tlmtry_backup'
 ```
 
 В YAML поля `database` и `backup_path` принимают либо путь к файлу SQLite, либо URL `postgres://` / `postgresql://`.
@@ -73,11 +88,11 @@ tlmtry-collector seed --database data/primary.db --hours 24 --reset
 tlmtry-collector status --database data/primary.db
 ```
 
-По умолчанию пишется 24 часа, и у каждого параметра свой шаг: 30 с, 60 с или 120 с. `--step-seconds` задаёт один шаг для всех параметров. Повторный запуск без `--reset` дописывает сэмплы, не удаляя старые. Для PostgreSQL сервер и пустая база должны уже существовать — скрипт создаёт таблицы и строки:
+По умолчанию пишется 24 часа, и у каждого параметра свой шаг: 30 с, 60 с или 120 с. `--step-seconds` задаёт один шаг для всех параметров. Повторный запуск без `--reset` дописывает сэмплы, не удаляя старые. Чтобы поднять PostgreSQL в Docker и сразу заполнить его, используйте `scripts/up_postgres.sh`. Если сервер уже запущен, достаточно передать URL:
 
 ```bash
 python scripts/seed_database.py --reset \
-  --database 'postgresql://tlmtry:secret@127.0.0.1:5432/tlmtry'
+  --database 'postgresql://tlmtry:tlmtry@127.0.0.1:5432/tlmtry'
 ```
 
 С реальным адаптером скопируйте [config/collector.example.yaml](config/collector.example.yaml), укажите `port` и:

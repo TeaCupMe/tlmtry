@@ -256,6 +256,20 @@ def test_cli_seed_rejects_bad_hours(tmp_path: Path, capsys: pytest.CaptureFixtur
     assert "hours" in captured.err
 
 
+def test_up_postgres_help():
+    script = Path(__file__).resolve().parents[2] / "scripts" / "up_postgres.sh"
+    proc = subprocess.run(
+        ["bash", str(script), "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0
+    assert "tlmtry-postgres" in proc.stdout
+    assert "pseudo telemetry" in proc.stdout
+    assert proc.stderr == ""
+
+
 def test_seed_script_help():
     script = Path(__file__).resolve().parents[2] / "scripts" / "seed_database.py"
     proc = subprocess.run(
