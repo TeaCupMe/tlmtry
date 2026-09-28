@@ -50,6 +50,33 @@ tlmtry-collector replicate \
 
 В YAML поля `database` и `backup_path` принимают либо путь к файлу SQLite, либо URL `postgres://` / `postgresql://`.
 
+### Псевдо-данные датчиков
+
+Скрипт создаёт схему (файл SQLite или таблицы в уже запущенном PostgreSQL) и заполняет её историей трёх лабораторных узлов:
+
+| Узел | Метрики |
+|------|---------|
+| `lab-node-1` | температура `temp_c` (°C), влажность `humidity` (%) |
+| `lab-node-2` | дверь `door_open`, счётчик `counter` |
+| `lab-node-3` | давление `pressure_hpa` (гПа), CO₂ `co2_ppm` |
+
+Ряды детерминированы: температура, влажность, давление и CO₂ — гладкие функции времени, дверь открывается на 30 с каждые 10 минут, счётчик растёт каждые 30 с.
+
+```bash
+python scripts/seed_database.py --database data/primary.db --reset
+
+# то же после установки пакета:
+tlmtry-collector seed --database data/primary.db --hours 24 --step-seconds 60 --reset
+tlmtry-collector status --database data/primary.db
+```
+
+По умолчанию пишется 24 часа с шагом 60 с. Повторный запуск без `--reset` дописывает сэмплы, не удаляя старые. Для PostgreSQL сервер и пустая база должны уже существовать — скрипт создаёт таблицы и строки:
+
+```bash
+python scripts/seed_database.py --reset \
+  --database 'postgresql://tlmtry:secret@127.0.0.1:5432/tlmtry'
+```
+
 С реальным адаптером скопируйте [config/collector.example.yaml](config/collector.example.yaml), укажите `port` и:
 
 ```bash
@@ -98,6 +125,7 @@ device.setPollIntervalMs(2000);
 | `run --sim` | То же со встроенным симулятором шины |
 | `discover` | Разовое сканирование устройств |
 | `replicate --to PATH_OR_URL` | Инкрементальная выгрузка в резервную SQLite или PostgreSQL |
+| `seed` | Создать схему и заполнить псевдо-показаниями датчиков |
 | `status` | Устройства и число сэмплов |
 
 ## Тесты

@@ -11,7 +11,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Literal
+from typing import Any, Iterable, Iterator, Literal, Sequence
 from urllib.parse import urlparse, urlunparse
 
 from .protocol import DeviceManifest, MetricType, SampleValue
@@ -163,6 +163,15 @@ class MetricCatalogRow:
     name: str
     type: int
     unit: str
+
+
+def _encode_sample(sample: SampleValue) -> tuple[float | None, str | None]:
+    if sample.type == MetricType.BOOL:
+        flag = bool(sample.value)
+        return (1.0 if flag else 0.0, "true" if flag else "false")
+    if sample.type in (MetricType.INT32, MetricType.UINT16, MetricType.FLOAT):
+        return (float(sample.value), None)
+    return (None, str(sample.value))
 
 
 class Storage:
@@ -361,38 +370,90 @@ class Storage:
         if not samples:
             return
         stamp = ts if ts is not None else time.time()
+        self.insert_many_samples([(address, samples, stamp)])
+
+    def insert_many_samples(
+        self,
+        batches: Iterable[tuple[int, Sequence[SampleValue], float]],
+        *,
+        chunk_size: int = 2000,
+    ) -> int:
+        """Insert ``(address, samples, ts)`` groups. Returns the number of rows.
+
+        ``last_seen`` moves forward to the newest timestamp written for each
+        address. Callers should pass timestamps in non-decreasing order.
+        """
+        count = 0
+        pending: list[tuple[int, SampleValue, float]] = []
+        latest: dict[int, float] = {}
+
+        def flush() -> None:
+            nonlocal count
+            if not pending:
+                return
+            with self.transaction():
+                for address, sample, ts in pending:
+                    value_real, value_text = _encode_sample(sample)
+                    self._execute(
+                        """
+                        INSERT INTO samples(
+                            address, metric_id, ts, value_real, value_text, type, quality
+                        ) VALUES (?, ?, ?, ?, ?, ?, 0)
+                        """,
+                        (
+                            address,
+                            sample.metric_id,
+                            ts,
+                            value_real,
+                            value_text,
+                            int(sample.type),
+                        ),
+                    )
+                    prev = latest.get(address)
+                    if prev is None or ts >= prev:
+                        latest[address] = ts
+                        self._execute(
+                            """
+                            UPDATE devices
+                            SET last_seen=?, online=1, last_error=NULL
+                            WHERE address=?
+                            """,
+                            (ts, address),
+                        )
+                    count += 1
+            pending.clear()
+
+        for address, samples, ts in batches:
+            for sample in samples:
+                pending.append((address, sample, ts))
+                if len(pending) >= chunk_size:
+                    flush()
+        flush()
+        return count
+
+    def clear(self) -> None:
+        """Delete devices, metrics, samples, and replication state."""
         with self.transaction():
-            for s in samples:
-                value_real: float | None
-                value_text: str | None
-                if s.type == MetricType.BOOL:
-                    value_real = 1.0 if s.value else 0.0
-                    value_text = "true" if s.value else "false"
-                elif s.type in (MetricType.INT32, MetricType.UINT16, MetricType.FLOAT):
-                    value_real = float(s.value)
-                    value_text = None
-                else:
-                    value_real = None
-                    value_text = str(s.value)
+            if self.backend == "postgres":
                 self._execute(
                     """
-                    INSERT INTO samples(
-                        address, metric_id, ts, value_real, value_text, type, quality
-                    ) VALUES (?, ?, ?, ?, ?, ?, 0)
-                    """,
-                    (
-                        address,
-                        s.metric_id,
-                        stamp,
-                        value_real,
-                        value_text,
-                        int(s.type),
-                    ),
+                    TRUNCATE TABLE samples, metrics, devices, replication_state
+                    RESTART IDENTITY CASCADE
+                    """
                 )
-            self._execute(
-                "UPDATE devices SET last_seen=?, online=1, last_error=NULL WHERE address=?",
-                (stamp, address),
+                return
+            self._execute("DELETE FROM samples")
+            self._execute("DELETE FROM metrics")
+            self._execute("DELETE FROM devices")
+            self._execute("DELETE FROM replication_state")
+            row = self._fetchone(
+                """
+                SELECT 1 AS ok FROM sqlite_master
+                WHERE type='table' AND name='sqlite_sequence'
+                """
             )
+            if row:
+                self._execute("DELETE FROM sqlite_sequence WHERE name = 'samples'")
 
     def sample_count(self) -> int:
         row = self._fetchone("SELECT COUNT(*) AS c FROM samples")
