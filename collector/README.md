@@ -8,5 +8,7 @@ pip install -e ".[dev]"          # includes psycopg for Postgres tests
 
 tlmtry-collector run --sim --database /tmp/primary.db
 tlmtry-collector run --sim --database 'postgresql://user:pass@127.0.0.1:5432/tlmtry'
+tlmtry-collector seed --database /tmp/primary.db --reset
+bash ../scripts/up_postgres.sh --hours 1
 pytest -q
 ```

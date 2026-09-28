@@ -13,6 +13,7 @@ from pathlib import Path
 from .config import load_config
 from .replicate import backup_ready, replicate
 from .scheduler import CollectorScheduler, SchedulerConfig
+from .seed import add_seed_arguments, run_seed
 from .serial_bus import Bus, SerialTransport
 from .storage import Storage
 
@@ -157,6 +158,10 @@ def cmd_replicate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_seed(args: argparse.Namespace) -> int:
+    return run_seed(args)
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     storage = Storage(args.database or cfg.database)
@@ -210,6 +215,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Primary DB: SQLite path or postgres:// / postgresql:// URL",
     )
     rep.set_defaults(func=cmd_replicate)
+
+    seed = sub.add_parser(
+        "seed",
+        help="Create the database schema and fill it with pseudo sensor readings",
+    )
+    add_seed_arguments(seed, include_config=False)
+    seed.set_defaults(func=cmd_seed)
 
     st = sub.add_parser("status", help="Show devices and sample counts")
     st.add_argument(

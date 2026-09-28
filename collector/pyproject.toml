@@ -19,6 +19,7 @@ dev = ["pytest>=8.0", "psycopg[binary]>=3.1"]
 
 [project.scripts]
 tlmtry-collector = "tlmtry_collector.__main__:main"
+tlmtry-seed = "tlmtry_collector.seed:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
