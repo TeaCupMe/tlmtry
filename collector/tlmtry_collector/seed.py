@@ -1,8 +1,11 @@
 """Create the telemetry schema and fill it with pseudo sensor history.
 
-The series are deterministic functions of unix time, so the same ``now``,
-``hours``, and ``step_s`` always produce the same readings. Devices match the
-lab nodes used by the in-process simulator, plus one air-quality node.
+The catalog follows the telemetry field list: temperature, illuminance,
+humidity, pressure, CO2, and O2 at each habitat module, plus the outside
+station (no CO2/O2). Each parameter keeps its own measurement rate.
+
+Series are deterministic functions of unix time, so the same ``now``,
+``hours``, and ``step_s`` always produce the same readings.
 """
 
 from __future__ import annotations
@@ -21,6 +24,9 @@ from .storage import Storage
 # Refuse accidental multi-million inserts unless the caller opts in.
 MAX_SAMPLE_ROWS = 2_000_000
 
+# Fastest spec rate (temperature, 120 measurements per hour).
+POLL_INTERVAL_MS = 30_000
+
 ValueFn = Callable[[float], int | float | bool]
 
 
@@ -30,7 +36,13 @@ class SeedMetric:
     name: str
     type: MetricType
     unit: str
+    per_hour: int
     value_at: ValueFn
+
+    def interval_s(self, step_s: float | None) -> float:
+        if step_s is not None:
+            return step_s
+        return 3600.0 / self.per_hour
 
 
 @dataclass(frozen=True)
@@ -44,67 +56,197 @@ class SeedDevice:
     fw_minor: int = 0
 
 
-def _temp_c(ts: float) -> float:
-    daily = math.sin(2 * math.pi * ts / 86400.0)
+@dataclass(frozen=True)
+class _Profile:
+    phase: float
+    temp_base: float
+    temp_amp: float
+    lux_peak: int
+    outside_light: bool
+    rh_base: float
+    rh_amp: float
+    pressure_base: float
+    pressure_amp: float
+    co2_base: float | None = None
+    co2_amp: float = 0.0
+    o2_base: float | None = None
+    o2_amp: float = 0.0
+
+
+def _temp_c(ts: float, profile: _Profile) -> float:
+    daily = math.sin(2 * math.pi * ts / 86400.0 + profile.phase)
     hourly = math.sin(2 * math.pi * ts / 3600.0)
-    return round(22.0 + 2.4 * daily + 0.35 * hourly, 2)
+    return round(profile.temp_base + profile.temp_amp * daily + 0.25 * hourly, 2)
 
 
-def _humidity(ts: float) -> float:
-    daily = math.cos(2 * math.pi * ts / 86400.0)
-    return round(48.0 + 12.0 * daily + 2.0 * math.sin(2 * math.pi * ts / 5400.0), 1)
+def _illuminance_lx(ts: float, profile: _Profile) -> int:
+    day = max(0.0, math.sin(2 * math.pi * ts / 86400.0 + profile.phase))
+    if profile.outside_light:
+        return int(round(100_000 * day))
+    return int(round(20 + profile.lux_peak * day))
 
 
-def _door_open(ts: float) -> bool:
-    # Open for the first 30 seconds of every 10 minutes.
-    return (int(ts) % 600) < 30
+def _humidity_pct(ts: float, profile: _Profile) -> float:
+    daily = math.cos(2 * math.pi * ts / 86400.0 + profile.phase)
+    return round(profile.rh_base + profile.rh_amp * daily, 1)
 
 
-def _counter(ts: float) -> int:
-    return (int(ts) // 30) % 65536
+def _pressure_kpa(ts: float, profile: _Profile) -> float:
+    wave = math.sin(2 * math.pi * ts / 21600.0 + profile.phase)
+    return round(profile.pressure_base + profile.pressure_amp * wave, 2)
 
 
-def _pressure_hpa(ts: float) -> float:
-    return round(1013.25 + 3.5 * math.sin(2 * math.pi * ts / 21600.0), 2)
+def _co2_ppm(ts: float, profile: _Profile) -> float:
+    wave = math.sin(2 * math.pi * ts / 10800.0 + profile.phase)
+    return round(float(profile.co2_base) + profile.co2_amp * wave, 1)
 
 
-def _co2_ppm(ts: float) -> int:
-    val = 620.0 + 180.0 * math.sin(2 * math.pi * ts / 10800.0)
-    if (int(ts) // 3600) % 5 == 0:
-        val += 250.0
-    return max(400, min(5000, int(val)))
+def _o2_pct(ts: float, profile: _Profile) -> float:
+    wave = math.sin(2 * math.pi * ts / 10800.0 + profile.phase + 1.0)
+    return round(float(profile.o2_base) + profile.o2_amp * wave, 2)
 
 
+def _bind(fn: Callable[[float, _Profile], int | float], profile: _Profile) -> ValueFn:
+    def value_at(ts: float) -> int | float:
+        return fn(ts, profile)
+
+    return value_at
+
+
+def _parameter_name(kind: str, module_index: int | None) -> str:
+    if module_index is None:
+        return {
+            "temp": "Температура за бортом",
+            "lux": "Освещённость за бортом",
+            "rh": "Влажность за бортом",
+            "pressure": "Давление за бортом",
+        }[kind]
+    return {
+        "temp": f"Температура в модуле {module_index}",
+        "lux": f"Освещённость в модуле {module_index}",
+        "rh": f"Влажность в модуле {module_index}",
+        "pressure": f"Давление в модуле {module_index}",
+        "co2": f"Содержание CO2 в модуле {module_index}",
+        "o2": f"Содержание O2 в модуле {module_index}",
+    }[kind]
+
+
+def _device(
+    address: int,
+    device_id: int,
+    name: str,
+    module_index: int | None,
+    profile: _Profile,
+) -> SeedDevice:
+    metrics = [
+        SeedMetric(
+            0,
+            _parameter_name("temp", module_index),
+            MetricType.FLOAT,
+            "C",
+            120,
+            _bind(_temp_c, profile),
+        ),
+        SeedMetric(
+            1,
+            _parameter_name("lux", module_index),
+            MetricType.INT32,
+            "lx",
+            60,
+            _bind(_illuminance_lx, profile),
+        ),
+        SeedMetric(
+            2,
+            _parameter_name("rh", module_index),
+            MetricType.FLOAT,
+            "%",
+            60,
+            _bind(_humidity_pct, profile),
+        ),
+        SeedMetric(
+            3,
+            _parameter_name("pressure", module_index),
+            MetricType.FLOAT,
+            "kPa",
+            30,
+            _bind(_pressure_kpa, profile),
+        ),
+    ]
+    if module_index is not None:
+        metrics.extend(
+            [
+                SeedMetric(
+                    4,
+                    _parameter_name("co2", module_index),
+                    MetricType.FLOAT,
+                    "ppm",
+                    30,
+                    _bind(_co2_ppm, profile),
+                ),
+                SeedMetric(
+                    5,
+                    _parameter_name("o2", module_index),
+                    MetricType.FLOAT,
+                    "%",
+                    30,
+                    _bind(_o2_pct, profile),
+                ),
+            ]
+        )
+    return SeedDevice(
+        address=address,
+        device_id=device_id,
+        name=name,
+        poll_interval_ms=POLL_INTERVAL_MS,
+        metrics=tuple(metrics),
+    )
+
+
+# Locations and rates match the telemetry field list:
+# temperature 120/h, illuminance and humidity 60/h, pressure/CO2/O2 30/h.
+# CO2 and O2 are not collected outside the habitat.
 SEED_DEVICES: tuple[SeedDevice, ...] = (
-    SeedDevice(
-        address=1,
-        device_id=101,
-        name="lab-node-1",
-        poll_interval_ms=500,
-        metrics=(
-            SeedMetric(0, "temp_c", MetricType.FLOAT, "C", _temp_c),
-            SeedMetric(1, "humidity", MetricType.FLOAT, "%", _humidity),
-        ),
+    _device(
+        1,
+        101,
+        "Главный модуль",
+        1,
+        _Profile(0.1, 22.0, 1.5, 700, False, 50.0, 8.0, 101.30, 0.20, 750.0, 180.0, 20.90, 0.15),
     ),
-    SeedDevice(
-        address=2,
-        device_id=102,
-        name="lab-node-2",
-        poll_interval_ms=800,
-        metrics=(
-            SeedMetric(0, "door_open", MetricType.BOOL, "", _door_open),
-            SeedMetric(1, "counter", MetricType.UINT16, "cnt", _counter),
-        ),
+    _device(
+        2,
+        102,
+        "Жилой модуль 1",
+        2,
+        _Profile(0.6, 22.5, 1.6, 500, False, 55.0, 10.0, 101.25, 0.25, 950.0, 350.0, 20.70, 0.25),
     ),
-    SeedDevice(
-        address=3,
-        device_id=103,
-        name="lab-node-3",
-        poll_interval_ms=2000,
-        metrics=(
-            SeedMetric(0, "pressure_hpa", MetricType.FLOAT, "hPa", _pressure_hpa),
-            SeedMetric(1, "co2_ppm", MetricType.UINT16, "ppm", _co2_ppm),
-        ),
+    _device(
+        3,
+        103,
+        "Жилой модуль 2",
+        3,
+        _Profile(1.1, 22.2, 1.4, 450, False, 53.0, 9.0, 101.20, 0.25, 900.0, 300.0, 20.75, 0.20),
+    ),
+    _device(
+        4,
+        104,
+        "Био-модуль",
+        4,
+        _Profile(1.7, 24.0, 1.2, 8000, False, 72.0, 8.0, 101.40, 0.15, 520.0, 80.0, 21.15, 0.20),
+    ),
+    _device(
+        5,
+        105,
+        "Инженерный модуль",
+        5,
+        _Profile(2.3, 26.5, 1.8, 350, False, 38.0, 6.0, 101.10, 0.30, 680.0, 160.0, 20.80, 0.15),
+    ),
+    _device(
+        6,
+        106,
+        "За бортом",
+        None,
+        _Profile(3.0, 8.0, 10.0, 0, True, 65.0, 25.0, 101.30, 1.20),
     ),
 )
 
@@ -118,7 +260,7 @@ class SeedReport:
     samples: int
     start_ts: float
     end_ts: float
-    step_s: float
+    step_s: float | None
     reset: bool
 
 
@@ -151,15 +293,29 @@ def iter_sample_times(end: float, hours: float, step_s: float) -> Iterator[float
         yield (first_ms + i * step_ms) / 1000.0
 
 
-def _metric_count() -> int:
-    return sum(len(device.metrics) for device in SEED_DEVICES)
+def planned_samples(
+    end: float, hours: float, step_s: float | None
+) -> tuple[float, float, int]:
+    """Return ``(first_ts, last_ts, row_count)`` for the whole catalog."""
+    first = math.inf
+    last = -math.inf
+    total = 0
+    for device in SEED_DEVICES:
+        for metric in device.metrics:
+            metric_first, metric_last, count = sample_grid(
+                end, hours, metric.interval_s(step_s)
+            )
+            first = min(first, metric_first)
+            last = max(last, metric_last)
+            total += count
+    return float(first), float(last), total
 
 
 def seed_database(
     database: str,
     *,
     hours: float = 24.0,
-    step_s: float = 60.0,
+    step_s: float | None = None,
     reset: bool = False,
     force: bool = False,
     now: float | None = None,
@@ -168,10 +324,11 @@ def seed_database(
 
     ``database`` is a SQLite path or a ``postgres://`` / ``postgresql://`` URL.
     ``reset`` deletes existing catalog and sample rows before inserting.
+    ``step_s`` overrides every parameter's native interval. By default each
+    parameter uses the telemetry spec rate.
     """
     end = time.time() if now is None else now
-    _first, last, points = sample_grid(end, hours, step_s)
-    rows = points * _metric_count()
+    first, last, rows = planned_samples(end, hours, step_s)
     if rows > MAX_SAMPLE_ROWS and not force:
         raise ValueError(
             f"refusing to insert {rows} samples (limit {MAX_SAMPLE_ROWS}). "
@@ -205,19 +362,20 @@ def seed_database(
 
         def batches() -> Iterator[tuple[int, list[SampleValue], float]]:
             for device in SEED_DEVICES:
-                for ts in iter_sample_times(end, hours, step_s):
-                    yield (
-                        device.address,
-                        [
-                            SampleValue(
-                                metric_id=metric.metric_id,
-                                type=metric.type,
-                                value=metric.value_at(ts),
-                            )
-                            for metric in device.metrics
-                        ],
-                        ts,
-                    )
+                for metric in device.metrics:
+                    interval = metric.interval_s(step_s)
+                    for ts in iter_sample_times(end, hours, interval):
+                        yield (
+                            device.address,
+                            [
+                                SampleValue(
+                                    metric_id=metric.metric_id,
+                                    type=metric.type,
+                                    value=metric.value_at(ts),
+                                )
+                            ],
+                            ts,
+                        )
 
         inserted = storage.insert_many_samples(batches())
         return SeedReport(
@@ -226,7 +384,7 @@ def seed_database(
             devices=len(storage.list_devices()),
             metrics=len(storage.list_metrics()),
             samples=inserted,
-            start_ts=_first,
+            start_ts=first,
             end_ts=last,
             step_s=step_s,
             reset=reset,
@@ -238,10 +396,17 @@ def seed_database(
 def format_report(report: SeedReport) -> str:
     start = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(report.start_ts))
     end = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(report.end_ts))
+    if report.step_s is None:
+        step_text = (
+            "native intervals (temp 30s, illuminance/humidity 60s, "
+            "pressure/CO2/O2 120s)"
+        )
+    else:
+        step_text = f"step {report.step_s:g}s"
     lines = [
         f"database: {report.location} ({report.backend})",
         f"reset: {'yes' if report.reset else 'no'}",
-        f"span: {start} .. {end} (step {report.step_s:g}s)",
+        f"span: {start} .. {end} ({step_text})",
         f"devices: {report.devices}",
         f"metrics: {report.metrics}",
         f"samples inserted: {report.samples}",
@@ -284,8 +449,12 @@ def add_seed_arguments(
     parser.add_argument(
         "--step-seconds",
         type=float,
-        default=60.0,
-        help="Seconds between samples (default: 60)",
+        default=None,
+        help=(
+            "Override every parameter with one interval in seconds. "
+            "Default follows the telemetry spec: temperature 30s (120/h), "
+            "illuminance and humidity 60s (60/h), pressure, CO2 and O2 120s (30/h)"
+        ),
     )
     parser.add_argument(
         "--reset",
