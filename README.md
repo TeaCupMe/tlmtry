@@ -16,7 +16,7 @@ Arduino nodes (RS-485)  <-->  USB-RS485  <-->  tlmtry-collector  -->  primary (S
 
 Устройства сами сообщают манифест (метрики + желаемый интервал) по команде `DISCOVER`.
 
-Спецификация: [docs/protocol.md](docs/protocol.md), железо: [docs/hardware.md](docs/hardware.md).
+Спецификация: [docs/protocol.md](docs/protocol.md), железо: [docs/hardware.md](docs/hardware.md), база и запись из внешних скриптов: [docs/database.md](docs/database.md).
 
 ## Быстрый старт (ПК)
 
