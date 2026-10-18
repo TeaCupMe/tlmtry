@@ -100,6 +100,8 @@ device.setPollIntervalMs(2000);
 | `replicate --to PATH_OR_URL` | Инкрементальная выгрузка в резервную SQLite или PostgreSQL |
 | `status` | Устройства и число сэмплов |
 
+Как устроен один проход и как вызвать его из внешнего скрипта: [docs/replication.md](docs/replication.md).
+
 ## Тесты
 
 ```bash
