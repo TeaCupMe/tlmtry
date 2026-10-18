@@ -75,6 +75,10 @@ if docker ps -a --format '{{.Names}}' | grep -qx "$NAME"; then
     docker start "$NAME" >/dev/null
 else
     echo "Creating container ${NAME} from ${IMAGE} on port ${PORT}"
+
+    # echo "using init script: ${ROOT}/scripts/init-readonly.sql"
+    # cat "${ROOT}/scripts_db/init_readonly_user.sql"
+
     docker run -d \
         --name "$NAME" \
         --restart unless-stopped \
@@ -83,6 +87,7 @@ else
         -e "POSTGRES_DB=${DB}" \
         -p "${PORT}:5432" \
         -v "${VOLUME}:/var/lib/postgresql/data" \
+	-v "${ROOT}/scripts/init_readonly_user.sql:/docker-entrypoint-initdb.d/init-readonly.sql:ro"\
         --health-cmd "pg_isready -U ${USER_NAME} -d ${DB}" \
         --health-interval 2s \
         --health-timeout 5s \
