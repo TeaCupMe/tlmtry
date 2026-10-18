@@ -8,7 +8,7 @@ Type=simple
 User=tlmtry
 Group=dialout
 WorkingDirectory=/var/lib/tlmtry
-ExecStart=/usr/bin/tlmtry-collector run --config /etc/tlmtry/collector.yaml
+ExecStart=/usr/local/bin/tlmtry-collector -c /etc/tlmtry/collector.yaml run
 Restart=always
 RestartSec=3
 Environment=PYTHONUNBUFFERED=1
