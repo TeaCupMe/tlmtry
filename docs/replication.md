@@ -2,7 +2,7 @@
 
 Инкрементальное копирование телеметрии из основной базы в резервную. Источник и приёмник независимы: каждый может быть файлом SQLite или URL PostgreSQL (`postgres://` или `postgresql://`).
 
-Один проход делает функция `replicate`. Её вызывает и CLI, и фоновый поток сборщика. Внешний скрипт запускает тот же проход сам — сборщик для этого не нужен.
+Один проход делает функция `replicate`. Её вызывает и CLI, и фоновый поток сборщика. Внешний скрипт запускает тот же проход сам — сборщик для этого не нужен. Если прямой связи с резервной базой нет, снимок пишется во внешний файл и загружается вторым скриптом. Этот путь описан ниже, в разделе «Репликация через файл».
 
 ## Что копируется
 
@@ -200,3 +200,124 @@ tlmtry-collector replicate \
 - Пользователь источника должен читать `devices`, `metrics`, `samples` и писать `replication_state`. Пользователь приёмника должен создавать таблицы и писать во все четыре.
 
 Чтение резервной копии для отчётов к знаку отношения не имеет: знак живёт на источнике, на приёмнике лежит только `last_replicate_ts`.
+
+## Репликация через файл
+
+Два скрипта переносят тот же снимок через обычный JSON-файл. Его забирает другой скрипт, cron или копия на съёмный диск. Прямое соединение с резервной базой не нужно.
+
+| Скрипт | Что делает |
+|--------|------------|
+| `scripts/export_replication.py` | Пишет каталог и сэмплы с `id >= --from-id` |
+| `scripts/import_replication.py` | Загружает файл в базу и вставляет только новые `id` |
+
+Выгрузка не читает и не двигает водяной знак `samples_id`. Курсор хранит вызывающий скрипт. В ответе выгрузки это поле `next_from_id`: на единицу больше максимального выгруженного `id`, либо тот же `--from-id`, если новых строк не было. Записывать курсор можно только после того, как загрузка этого файла завершилась с кодом 0. Иначе потерянный или непринятый файл уже не попадёт в следующий снимок.
+
+Пока файл не загружен, следующую выгрузку в тот же путь не начинают. Второй запуск затрёт ещё не принятый пакет.
+
+Файл — один документ формата `tlmtry-replication` версии 1:
+
+- `devices` и `metrics` — полный каталог на момент выгрузки;
+- `samples` — строки с исходными `id`, начиная с `from_id` включительно;
+- повторная загрузка тех же `id` ничего в `samples` не меняет и обновляет каталог.
+
+Первый запуск начинает с `--from-id 1` (идентификаторы сэмплов начинаются с 1).
+
+### Команды
+
+Из корня репозитория, после установки сборщика (`pip install -e collector` или `pip install -e "collector[postgres]"`):
+
+```bash
+python3 scripts/export_replication.py \
+  --database /var/lib/tlmtry/primary.db \
+  --from-id 1 \
+  --output /media/backup/tlmtry-batch.json
+
+python3 scripts/import_replication.py \
+  --database /var/lib/tlmtry/backup.db \
+  --input /media/backup/tlmtry-batch.json
+```
+
+`--database` принимает путь SQLite или URL `postgres://` / `postgresql://`. Вместо него можно передать `-c /etc/tlmtry/collector.yaml`: тогда берётся поле `database` этого файла. Для загрузки в другую базу `--database` всё равно нужен, потому что конфиг сборщика указывает на источник.
+
+Каталог для `--output` должен уже существовать. Скрипт не создаёт отсутствующий путь съёмного диска.
+
+Оба скрипта пишут в stdout один JSON-объект и заканчивают его переводом строки. Журнал идёт в stderr.
+
+Выгрузка:
+
+```json
+{"from_id": 1, "exported_samples": 12, "max_id": 12, "next_from_id": 13, "output": "/media/backup/tlmtry-batch.json"}
+```
+
+Загрузка:
+
+```json
+{"from_id": 1, "file_samples": 12, "inserted_samples": 12, "skipped_samples": 0, "max_id": 12, "input": "/media/backup/tlmtry-batch.json"}
+```
+
+Код выхода `0` — проход выполнен, `2` — не задана база, `1` — ошибка файла или базы. При ошибке загрузки транзакция приёмника откатывается, курсор снаружи менять нельзя.
+
+### Цикл из другого скрипта
+
+```bash
+#!/bin/sh
+set -eu
+
+primary=/var/lib/tlmtry/primary.db
+backup=/var/lib/tlmtry/backup.db
+batch=/media/backup/tlmtry-batch.json
+cursor=/var/lib/tlmtry/file-cursor
+
+from_id=1
+if [ -f "$cursor" ]; then
+    from_id=$(cat "$cursor")
+fi
+
+exported=$(python3 scripts/export_replication.py \
+    --database "$primary" \
+    --from-id "$from_id" \
+    --output "$batch")
+
+python3 scripts/import_replication.py \
+    --database "$backup" \
+    --input "$batch"
+
+next_id=$(printf '%s\n' "$exported" | python3 -c 'import json,sys; print(json.load(sys.stdin)["next_from_id"])')
+printf '%s\n' "$next_id" > "$cursor"
+```
+
+`next_from_id` попадает в файл курсора только если загрузка вернула 0: при `set -e` скрипт останавливается раньше. Следующий проход снова начнётся с того же id, а загрузка пропустит уже принятые строки.
+
+Тот же порядок из Python, если оба шага в одном процессе:
+
+```python
+from pathlib import Path
+
+from tlmtry_collector.file_transfer import export_since, import_file
+from tlmtry_collector.storage import Storage
+
+PRIMARY = "/var/lib/tlmtry/primary.db"
+BACKUP = "/var/lib/tlmtry/backup.db"
+BATCH = Path("/media/backup/tlmtry-batch.json")
+CURSOR = Path("/var/lib/tlmtry/file-cursor")
+
+
+def replicate_via_file() -> None:
+    from_id = int(CURSOR.read_text()) if CURSOR.exists() else 1
+    source = Storage(PRIMARY)
+    try:
+        exported = export_since(source, from_id, BATCH)
+    finally:
+        source.close()
+
+    dest = Storage(BACKUP)
+    try:
+        import_file(dest, BATCH)
+    finally:
+        dest.close()
+
+    CURSOR.write_text(f"{exported['next_from_id']}\n")
+```
+
+Функции те же, что вызывают скрипты. `export_since` не закрывает источник, `import_file` не закрывает приёмник.
+

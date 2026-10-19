@@ -102,6 +102,13 @@ device.setPollIntervalMs(2000);
 
 Как устроен один проход и как вызвать его из внешнего скрипта: [docs/replication.md](docs/replication.md).
 
+Выгрузка в файл начиная с id и загрузка новых строк из этого файла:
+
+```bash
+python3 scripts/export_replication.py --database /tmp/tlmtry-primary.db --from-id 1 --output /tmp/tlmtry-batch.json
+python3 scripts/import_replication.py --database /tmp/tlmtry-backup.db --input /tmp/tlmtry-batch.json
+```
+
 ## Тесты
 
 ```bash

@@ -398,6 +398,20 @@ class Storage:
         row = self._fetchone("SELECT COUNT(*) AS c FROM samples")
         return int(self._row_get(row, "c"))
 
+    def sample_ids_present(self, ids: list[int]) -> set[int]:
+        """Return the subset of sample ids that already exist."""
+        present: set[int] = set()
+        chunk_size = 500
+        for offset in range(0, len(ids), chunk_size):
+            chunk = ids[offset : offset + chunk_size]
+            placeholders = ", ".join("?" for _ in chunk)
+            rows = self._fetchall(
+                f"SELECT id FROM samples WHERE id IN ({placeholders})",
+                tuple(chunk),
+            )
+            present.update(int(self._row_get(row, "id")) for row in rows)
+        return present
+
     def get_replication_watermark(self, key: str = "samples_id") -> int:
         row = self._fetchone(
             "SELECT value FROM replication_state WHERE key = ?", (key,)
