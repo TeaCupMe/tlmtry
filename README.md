@@ -54,11 +54,10 @@ tlmtry-collector replicate \
 
 ## Дашборд (Grafana)
 
-Отдельный контейнер читает ту же PostgreSQL и показывает **все** ряды, не только устройства из таблицы `devices`:
+Отдельный контейнер читает ту же PostgreSQL и показывает **все** строки `samples`, не только адреса из `devices`. Другие скрипты пишут в ту же таблицу.
 
-- `samples` сборщика, если адрес есть в `devices` (имя, единица, онлайн)
-- `samples` без строки в `devices` — источник `uncatalogued`
-- `external_samples` — сюда пишут остальные скрипты
+- адрес есть в `devices` — источник `collector`, имя и единица берутся из `metrics`
+- адреса в `devices` нет — источник `uncatalogued`, на графике это `address N / metric M`
 
 ```bash
 bash scripts/up_postgres.sh
@@ -66,21 +65,22 @@ bash scripts/up_dashboard.sh
 # http://127.0.0.1:3000  — смотреть можно без входа
 ```
 
-Пример для стороннего скрипта (время — unix-секунды, как у сборщика):
+Пример для стороннего скрипта (время — unix-секунды, как у сборщика; `type` как в протоколе: 0 = i32, 1 = f32, 2 = bool, 3 = u16):
 
 ```sql
-INSERT INTO external_samples (source, device, sensor, ts, value_real, unit)
+INSERT INTO samples (address, metric_id, ts, value_real, value_text, type, quality)
 VALUES (
-    'calib',
-    'bench-2',
-    'pressure',
+    250,
+    1,
     EXTRACT(EPOCH FROM clock_timestamp()),
     1.23,
-    'bar'
+    NULL,
+    1,
+    0
 );
 ```
 
-Новый `source` / датчик сам появляется в фильтрах дашборда. Представление, которое читает Grafana, — `v_sensor_readings`. Схема ставится при `up_postgres.sh` и повторно при `up_dashboard.sh`.
+Новая пара address/metric сама появляется в фильтрах. Представление, которое читает Grafana, — `v_sensor_readings`. Схема ставится при `up_postgres.sh` и повторно при `up_dashboard.sh`.
 
 Разные единицы измерения рисуются на одной оси. В легенде единица указана в имени ряда, фильтр «Датчик» оставляет сопоставимые графики.
 

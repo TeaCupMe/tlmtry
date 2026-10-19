@@ -2,7 +2,7 @@
   "annotations": {
     "list": []
   },
-  "description": "Все показания из v_sensor_readings: сборщик (devices + samples) и любые другие скрипты (external_samples или samples без устройства).",
+  "description": "Все строки samples: с именем из devices/metrics, если адрес есть в каталоге, и как address/metric, если устройства нет.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -572,7 +572,7 @@
           "showLineNumbers": false,
           "showMiniMap": false
         },
-        "content": "### Другие скрипты\n\nДашборд не смотрит только в `devices`. Он читает представление `v_sensor_readings`:\n\n- **collector** — строка `samples`, адрес есть в `devices`\n- **uncatalogued** — `samples` без устройства\n- **имя source** — таблица `external_samples`\n\n```sql\nINSERT INTO external_samples\n  (source, device, sensor, ts, value_real, unit)\nVALUES (\n  'calib', 'bench-2', 'pressure',\n  EXTRACT(EPOCH FROM clock_timestamp()),\n  1.23, 'bar');\n```\n\nНовый ряд сам появляется в фильтрах сверху.",
+        "content": "### Все писатели — в `samples`\n\nОтдельной таблицы нет. Дашборд читает `v_sensor_readings`:\n\n- **collector** — адрес есть в `devices`, имя из `metrics`\n- **uncatalogued** — строки `samples` без устройства\n\n```sql\nINSERT INTO samples (\n  address, metric_id, ts,\n  value_real, value_text, type, quality)\nVALUES (\n  250, 1,\n  EXTRACT(EPOCH FROM clock_timestamp()),\n  1.23, NULL, 1, 0);\n```\n\nНовая пара address/metric сама появляется в фильтрах сверху.",
         "mode": "markdown"
       },
       "title": "Откуда данные",

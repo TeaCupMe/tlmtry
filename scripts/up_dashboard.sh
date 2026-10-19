@@ -4,8 +4,8 @@
 # Usage:
 #   bash scripts/up_dashboard.sh
 #
-# The dashboard reads v_sensor_readings: collector samples (joined to devices
-# when that row exists) and external_samples written by other scripts.
+# The dashboard reads v_sensor_readings: every row in samples, joined to
+# devices and metrics when that address was catalogued.
 # If the PostgreSQL container is missing, this script starts it first.
 #
 # Environment (PostgreSQL side matches scripts/up_postgres.sh):
@@ -53,10 +53,9 @@ Grafana joins the Docker network ${NETWORK} and reads PostgreSQL through the
 DNS name tlmtry-db (container ${PG_NAME}). The page is http://127.0.0.1:${GPORT}
 with anonymous view access. Sign in as ${ADMIN_USER} to edit.
 
-The readings view covers:
-  - samples joined to devices/metrics when the collector has catalogued them
-  - samples whose address is not in devices
-  - external_samples, the table other scripts insert into
+The readings view is every row in samples:
+  - joined to devices/metrics when that address is catalogued
+  - otherwise shown as address N / metric M
 
 Stop the container:  docker stop ${GNAME}
 Remove it:           docker rm -f ${GNAME}
