@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from typing import Protocol
 
 from .protocol import (
@@ -152,9 +153,13 @@ class Bus:
         address_max: int = 100,
         use_broadcast: bool = True,
         unicast_fill: bool = True,
+        on_progress: Callable[[str], None] | None = None,
     ) -> list[DeviceManifest]:
+        """Scan the bus. ``on_progress`` receives ``broadcast`` or ``unicast:addr:i:n``."""
         found: dict[int, DeviceManifest] = {}
         if use_broadcast:
+            if on_progress is not None:
+                on_progress("broadcast")
             # Listen long enough for staggered replies (addr * 5 ms on device).
             listen_s = max(0.6, address_max * 0.005 + 0.2)
             for frame in self.collect_broadcast(
@@ -166,9 +171,14 @@ class Bus:
                 except ValueError as exc:
                     log.warning("bad discover_ack from %s: %s", frame.addr, exc)
         if unicast_fill:
-            for addr in range(address_min, address_max + 1):
-                if addr in found:
-                    continue
+            pending = [
+                addr
+                for addr in range(address_min, address_max + 1)
+                if addr not in found
+            ]
+            for index, addr in enumerate(pending, start=1):
+                if on_progress is not None:
+                    on_progress(f"unicast:{addr}:{index}:{len(pending)}")
                 try:
                     # Short probe timeout — empty addresses should fail fast.
                     manifest = self.discover_one(addr, timeout_s=self.probe_timeout_s)

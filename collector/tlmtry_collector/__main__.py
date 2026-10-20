@@ -157,6 +157,13 @@ def cmd_replicate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_gui(_args: argparse.Namespace) -> int:
+    from .gui import main as gui_main
+
+    gui_main()
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     storage = Storage(args.database or cfg.database)
@@ -210,6 +217,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Primary DB: SQLite path or postgres:// / postgresql:// URL",
     )
     rep.set_defaults(func=cmd_replicate)
+
+    gui = sub.add_parser("gui", help="Open the sensor debug window")
+    gui.set_defaults(func=cmd_gui)
 
     st = sub.add_parser("status", help="Show devices and sample counts")
     st.add_argument(
