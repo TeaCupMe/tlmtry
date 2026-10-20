@@ -6,7 +6,20 @@
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
-  "links": [],
+  "links": [
+    {
+      "asDropdown": false,
+      "icon": "apps",
+      "includeVars": false,
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
+      "title": "Все показатели",
+      "tooltip": "Каждый показатель в отдельном окне",
+      "type": "link",
+      "url": "/d/tlmtry-tiles"
+    }
+  ],
   "liveNow": false,
   "panels": [
     {
