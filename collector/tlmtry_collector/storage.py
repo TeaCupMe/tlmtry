@@ -223,6 +223,15 @@ class Storage:
             return None
         return self._conn.execute(self._sql(sql), params)
 
+    def _executemany(self, sql: str, params: list[tuple[Any, ...]]) -> None:
+        if not params:
+            return
+        if self.backend == "postgres":
+            with self._conn.cursor() as cur:
+                cur.executemany(self._sql(sql), params)
+            return
+        self._conn.executemany(self._sql(sql), params)
+
     def _fetchone(self, sql: str, params: tuple[Any, ...] | list[Any] = ()) -> Any:
         if self.backend == "postgres":
             with self._conn.cursor() as cur:
@@ -335,6 +344,69 @@ class Storage:
             for r in rows
         ]
 
+    def get_metric(self, address: int, metric_id: int) -> MetricCatalogRow | None:
+        row = self._fetchone(
+            """
+            SELECT address, metric_id, name, type, unit
+            FROM metrics WHERE address = ? AND metric_id = ?
+            """,
+            (address, metric_id),
+        )
+        if row is None:
+            return None
+        return MetricCatalogRow(
+            address=int(self._row_get(row, "address")),
+            metric_id=int(self._row_get(row, "metric_id")),
+            name=str(self._row_get(row, "name")),
+            type=int(self._row_get(row, "type")),
+            unit=str(self._row_get(row, "unit")),
+        )
+
+    def ensure_virtual_metric(
+        self,
+        address: int,
+        metric_id: int,
+        *,
+        device_name: str = "virtual",
+        metric_name: str = "value",
+        unit: str = "",
+        metric_type: int = int(MetricType.FLOAT),
+    ) -> MetricCatalogRow:
+        """Return the metric, creating a virtual device and metric when absent.
+
+        An existing device or metric is left unchanged. Discovery of the same
+        address later replaces the metric catalog, so virtual addresses should
+        sit outside the collector scan range.
+        """
+        existing = self.get_metric(address, metric_id)
+        if existing is not None:
+            return existing
+        with self.transaction():
+            found = self._fetchone(
+                "SELECT address FROM devices WHERE address = ?", (address,)
+            )
+            if found is None:
+                self._execute(
+                    """
+                    INSERT INTO devices(
+                        address, device_id, name, fw_major, fw_minor,
+                        poll_interval_ms, last_seen, online, last_error
+                    ) VALUES (?, ?, ?, 0, 0, 0, NULL, 0, NULL)
+                    """,
+                    (address, address, device_name),
+                )
+            self._execute(
+                """
+                INSERT INTO metrics(address, metric_id, name, type, unit)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (address, metric_id, metric_name, int(metric_type), unit),
+            )
+        created = self.get_metric(address, metric_id)
+        if created is None:  # pragma: no cover - insert just succeeded
+            raise RuntimeError("virtual metric was not stored")
+        return created
+
     def mark_online(self, address: int, online: bool, error: str | None = None) -> None:
         now = time.time()
         with self.transaction():
@@ -393,6 +465,63 @@ class Storage:
                 "UPDATE devices SET last_seen=?, online=1, last_error=NULL WHERE address=?",
                 (stamp, address),
             )
+
+    def insert_reading_rows(
+        self,
+        address: int,
+        metric_id: int,
+        rows: list[tuple[float, float | None, str | None, int]],
+    ) -> int:
+        """Insert timestamped readings for one metric.
+
+        Each row is ``(ts, value_real, value_text, type)``. ``last_seen`` moves
+        forward to the newest timestamp and is never moved backward. ``online``
+        is left as it is: imported readings are not a live poll.
+        """
+        if not rows:
+            return 0
+        params = [
+            (address, metric_id, ts, value_real, value_text, metric_type)
+            for ts, value_real, value_text, metric_type in rows
+        ]
+        latest = max(ts for ts, _, _, _ in rows)
+        sql = """
+            INSERT INTO samples(
+                address, metric_id, ts, value_real, value_text, type, quality
+            ) VALUES (?, ?, ?, ?, ?, ?, 0)
+        """
+        with self.transaction():
+            chunk_size = 500
+            for offset in range(0, len(params), chunk_size):
+                self._executemany(sql, params[offset : offset + chunk_size])
+            self._execute(
+                """
+                UPDATE devices
+                SET last_seen = ?
+                WHERE address = ? AND (last_seen IS NULL OR last_seen < ?)
+                """,
+                (latest, address, latest),
+            )
+        return len(rows)
+
+    def sample_timestamps_present(
+        self, address: int, metric_id: int, timestamps: list[float]
+    ) -> set[float]:
+        """Return timestamps that already have a sample for this metric."""
+        present: set[float] = set()
+        chunk_size = 500
+        for offset in range(0, len(timestamps), chunk_size):
+            chunk = timestamps[offset : offset + chunk_size]
+            placeholders = ", ".join("?" for _ in chunk)
+            rows = self._fetchall(
+                f"""
+                SELECT ts FROM samples
+                WHERE address = ? AND metric_id = ? AND ts IN ({placeholders})
+                """,
+                (address, metric_id, *chunk),
+            )
+            present.update(float(self._row_get(row, "ts")) for row in rows)
+        return present
 
     def sample_count(self) -> int:
         row = self._fetchone("SELECT COUNT(*) AS c FROM samples")

@@ -109,6 +109,21 @@ python3 scripts/export_replication.py --database /tmp/tlmtry-primary.db --from-i
 python3 scripts/import_replication.py --database /tmp/tlmtry-backup.db --input /tmp/tlmtry-batch.json
 ```
 
+Виртуальные показания из CSV (каждая строка `unix_time; value;`, десятичная запятая допустима) пишутся в `samples` как обычные сэмплы и дальше реплицируются вместе с ними:
+
+```bash
+python3 scripts/import_virtual_readings.py \
+  --database /var/lib/tlmtry/primary.db \
+  --address 101 \
+  --metric-id 0 \
+  --create-virtual \
+  --metric-name temp_c \
+  --unit C \
+  --input readings.csv
+```
+
+`--create-virtual` заводит устройство и метрику типа float, если их ещё нет. Адрес лучше брать вне диапазона опроса сборщика (по умолчанию 1..100): следующий `DISCOVER` этого адреса заменяет каталог метрик. Для уже известной метрики флаг не нужен — тип берётся из каталога. Повторная загрузка той же метки времени пропускается. Устройство от импорта не становится online; `last_seen` сдвигается только вперёд.
+
 ## Тесты
 
 ```bash
