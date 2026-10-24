@@ -12,6 +12,8 @@
 ```
 Arduino nodes (RS-485)  <-->  USB-RS485  <-->  tlmtry-collector  -->  primary (SQLite | PostgreSQL)
                                                               \-->  backup (SQLite | PostgreSQL)
+
+PostgreSQL  -->  Grafana (отдельный контейнер, показания всех датчиков)
 ```
 
 Устройства сами сообщают манифест (метрики + желаемый интервал) по команде `DISCOVER`.
@@ -49,6 +51,43 @@ tlmtry-collector replicate \
 ```
 
 В YAML поля `database` и `backup_path` принимают либо путь к файлу SQLite, либо URL `postgres://` / `postgresql://`.
+
+## Дашборд (Grafana)
+
+Отдельный контейнер читает ту же PostgreSQL и показывает **все** строки `samples`, не только адреса из `devices`. Другие скрипты пишут в ту же таблицу.
+
+- адрес есть в `devices` — источник `collector`, имя и единица берутся из `metrics`
+- адреса в `devices` нет — источник `uncatalogued`, на графике это `address N / metric M`
+
+```bash
+bash scripts/up_postgres.sh
+bash scripts/up_dashboard.sh
+# http://127.0.0.1:3000  — смотреть можно без входа
+```
+
+Два экрана, переключение в шапке Grafana:
+
+- `/d/tlmtry-sensors` — общий график, последние значения и статус устройств
+- `/d/tlmtry-tiles` — каждый показатель в своём окне, все сразу
+
+Пример для стороннего скрипта (время — unix-секунды, как у сборщика; `type` как в протоколе: 0 = i32, 1 = f32, 2 = bool, 3 = u16):
+
+```sql
+INSERT INTO samples (address, metric_id, ts, value_real, value_text, type, quality)
+VALUES (
+    250,
+    1,
+    EXTRACT(EPOCH FROM clock_timestamp()),
+    1.23,
+    NULL,
+    1,
+    0
+);
+```
+
+Новая пара address/metric сама появляется в фильтрах. Представление, которое читает Grafana, — `v_sensor_readings`. Схема ставится при `up_postgres.sh` и повторно при `up_dashboard.sh`.
+
+Разные единицы измерения рисуются на одной оси. В легенде единица указана в имени ряда, фильтр «Датчик» оставляет сопоставимые графики.
 
 С реальным адаптером скопируйте [config/collector.example.yaml](config/collector.example.yaml), укажите `port` и:
 

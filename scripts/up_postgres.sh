@@ -16,11 +16,19 @@
 #   TLMTRY_PG_PASSWORD   password (default tlmtry)
 #   TLMTRY_PG_DB         database name (default tlmtry)
 #   TLMTRY_PG_VOLUME     named volume (default tlmtry-pg-data)
+#   TLMTRY_DOCKER_NETWORK
+#                        network shared with Grafana (default tlmtry)
+#   TLMTRY_PG_READONLY_USER
+#                        dashboard login (default us)
+#   TLMTRY_PG_READONLY_PASSWORD
+#                        dashboard password (default matches scripts/init_readonly_user.sql)
 #   PYTHON               python interpreter (default python3)
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=tlmtry_docker.sh
+source "$ROOT/scripts/tlmtry_docker.sh"
 
 IMAGE="${TLMTRY_PG_IMAGE:-postgres:16}"
 NAME="${TLMTRY_PG_CONTAINER:-tlmtry-postgres}"
@@ -29,7 +37,11 @@ USER_NAME="${TLMTRY_PG_USER:-tlmtry}"
 PASSWORD="${TLMTRY_PG_PASSWORD:-tlmtry}"
 DB="${TLMTRY_PG_DB:-tlmtry}"
 VOLUME="${TLMTRY_PG_VOLUME:-tlmtry-pg-data}"
+NETWORK="${TLMTRY_DOCKER_NETWORK:-tlmtry}"
+RO_USER="${TLMTRY_PG_READONLY_USER:-us}"
+RO_PASSWORD="${TLMTRY_PG_READONLY_PASSWORD:-H2wf6w90dw4}"
 PYTHON="${PYTHON:-python3}"
+SQL_FILE="$ROOT/deploy/dashboard/sql/001_sensor_readings.sql"
 
 usage() {
     cat <<EOF
@@ -40,6 +52,9 @@ Start the ${NAME} PostgreSQL container and load pseudo telemetry.
 The container publishes port ${PORT}, with user, password, and database
 "${USER_NAME}". Data is stored in the Docker volume ${VOLUME}. Re-running
 the script starts the same container and replaces the telemetry rows.
+
+The container joins the Docker network ${NETWORK} as tlmtry-db and installs
+the sensor view used by scripts/up_dashboard.sh.
 
 Extra arguments are forwarded to scripts/seed_database.py, for example:
 
@@ -70,6 +85,12 @@ fi
 #    "$PYTHON" -m pip install 'psycopg[binary]>=3.1'
 #fi
 
+docker network inspect "$NETWORK" >/dev/null 2>&1 || docker network create "$NETWORK" >/dev/null
+network_alias=()
+if [[ "$NAME" != "tlmtry-db" ]]; then
+    network_alias=(--network-alias tlmtry-db)
+fi
+
 if docker ps -a --format '{{.Names}}' | grep -qx "$NAME"; then
     echo "Starting existing container ${NAME}"
     docker start "$NAME" >/dev/null
@@ -82,6 +103,8 @@ else
     docker run -d \
         --name "$NAME" \
         --restart unless-stopped \
+        --network "$NETWORK" \
+        "${network_alias[@]}" \
         -e "POSTGRES_USER=${USER_NAME}" \
         -e "POSTGRES_PASSWORD=${PASSWORD}" \
         -e "POSTGRES_DB=${DB}" \
@@ -135,6 +158,11 @@ PY
 # echo "Loading pseudo telemetry into ${database_url}"
 # "$PYTHON" "$ROOT/scripts/seed_database.py" --reset "$@" --database "$database_url"
 
+tlmtry_ensure_db_network "$NETWORK" "$NAME"
+echo "Installing sensor readings view"
+tlmtry_ensure_readings_schema "$NAME" "$USER_NAME" "$DB" "$RO_USER" "$RO_PASSWORD" "$SQL_FILE"
+
 echo
 echo "PostgreSQL is ready: ${database_url}"
+echo "Dashboard: bash scripts/up_dashboard.sh"
 echo "Stop the container with: docker stop ${NAME}"

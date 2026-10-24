@@ -54,6 +54,8 @@ def _reset_pg(url: str) -> None:
     with psycopg.connect(url, autocommit=True) as conn:
         conn.execute(
             """
+            DROP VIEW IF EXISTS v_sensor_readings;
+            DROP TABLE IF EXISTS external_samples CASCADE;
             DROP TABLE IF EXISTS samples CASCADE;
             DROP TABLE IF EXISTS metrics CASCADE;
             DROP TABLE IF EXISTS devices CASCADE;

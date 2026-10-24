@@ -1,0 +1,14 @@
+# sensors.json uses allValue "'__all__'" (quotes included). Grafana inserts a
+# custom All value as raw SQL and does not apply the sqlstring formatter.
+apiVersion: 1
+
+providers:
+  - name: tlmtry
+    orgId: 1
+    folder: Tlmtry
+    type: file
+    disableDeletion: true
+    updateIntervalSeconds: 30
+    allowUiUpdates: false
+    options:
+      path: /etc/grafana/dashboards
