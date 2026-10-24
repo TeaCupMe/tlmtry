@@ -7,17 +7,29 @@ between columns stays a semicolon. Blank lines, ``#`` comments, and a header
 
 Readings are stored like polled samples and are picked up by replication.
 They do not mark the device online. ``last_seen`` moves only forward.
+
+``import_virtual_readings`` writes the whole file in one transaction.
+``follow_virtual_readings`` writes one row every ``every`` seconds and keeps
+running until stopped. Each row keeps the ``unix_time`` and value from the file.
 """
 
 from __future__ import annotations
 
+import logging
 import math
+import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .protocol import MetricType
-from .storage import Storage
+from .storage import MetricCatalogRow, Storage
+
+log = logging.getLogger(__name__)
+
+# Seconds to wait. None waits until stop. Return True when stop was requested.
+WaitFn = Callable[[float | None], bool]
 
 
 class ReadingsFileError(ValueError):
@@ -77,6 +89,139 @@ def import_virtual_readings(
     With it, a missing device and metric are created (type float) and an
     existing metric is kept as it is.
     """
+    path, metric, rows = _prepare(
+        storage,
+        csv_path,
+        address,
+        metric_id,
+        create_virtual=create_virtual,
+        device_name=device_name,
+        metric_name=metric_name,
+        unit=unit,
+    )
+    present = storage.sample_timestamps_present(
+        address, metric_id, [ts for ts, _, _, _ in rows]
+    )
+    pending = [row for row in rows if row[0] not in present]
+    inserted = storage.insert_reading_rows(address, metric_id, pending)
+    return _summary(
+        metric,
+        path,
+        inserted=inserted,
+        skipped=len(rows) - len(pending),
+    )
+
+
+def follow_virtual_readings(
+    storage: Storage,
+    csv_path: str | Path,
+    address: int,
+    metric_id: int,
+    every: float,
+    *,
+    create_virtual: bool = False,
+    device_name: str = "virtual",
+    metric_name: str = "value",
+    unit: str = "",
+    stop: threading.Event | None = None,
+    wait: WaitFn | None = None,
+) -> dict[str, Any]:
+    """Insert one CSV row every ``every`` seconds until ``stop`` is set.
+
+    The first row that is not already stored is written immediately. Each
+    later row waits ``every`` seconds. A timestamp already in the database is
+    skipped without waiting, so a restarted process continues the file.
+    After the last row the call waits until stopped and writes nothing more.
+    """
+    if not math.isfinite(every) or every <= 0:
+        raise ValueError("every must be a positive number of seconds")
+    if stop is None:
+        stop = threading.Event()
+    if wait is None:
+        def wait(seconds: float | None) -> bool:
+            if seconds is None:
+                stop.wait()
+                return True
+            return stop.wait(seconds)
+
+    path, metric, rows = _prepare(
+        storage,
+        csv_path,
+        address,
+        metric_id,
+        create_virtual=create_virtual,
+        device_name=device_name,
+        metric_name=metric_name,
+        unit=unit,
+    )
+    present = storage.sample_timestamps_present(
+        address, metric_id, [ts for ts, _, _, _ in rows]
+    )
+    inserted = 0
+    skipped = 0
+    index = 0
+    stopped = False
+    while index < len(rows):
+        if stop.is_set():
+            stopped = True
+            break
+        ts, value_real, value_text, metric_type = rows[index]
+        index += 1
+        if ts in present:
+            skipped += 1
+            continue
+        storage.insert_reading_rows(
+            address,
+            metric_id,
+            [(ts, value_real, value_text, metric_type)],
+        )
+        present.add(ts)
+        inserted += 1
+        shown = value_real if value_real is not None else value_text
+        log.info(
+            "inserted virtual reading address=%s metric_id=%s ts=%s value=%s",
+            address,
+            metric_id,
+            ts,
+            shown,
+        )
+        if index >= len(rows):
+            break
+        if stop.is_set() or wait(every):
+            stopped = True
+            break
+
+    if not stopped and not stop.is_set():
+        log.info(
+            "csv readings loaded inserted=%s skipped=%s; waiting until stop",
+            inserted,
+            skipped,
+        )
+        wait(None)
+        stopped = True
+
+    return _summary(
+        metric,
+        path,
+        inserted=inserted,
+        skipped=skipped,
+        remaining_samples=len(rows) - index,
+        every=every,
+        stopped=stopped or stop.is_set(),
+    )
+
+
+def _prepare(
+    storage: Storage,
+    csv_path: str | Path,
+    address: int,
+    metric_id: int,
+    *,
+    create_virtual: bool,
+    device_name: str,
+    metric_name: str,
+    unit: str,
+) -> tuple[Path, MetricCatalogRow, list[tuple[float, float | None, str | None, int]]]:
     if address < 1:
         raise ValueError("address must be >= 1")
     if metric_id < 0:
@@ -98,10 +243,8 @@ def import_virtual_readings(
                 f"metric address={address} metric_id={metric_id} not found; "
                 "discover the device or pass --create-virtual"
             )
-        pending = points
-        skipped = 0
         # Validate the file before creating a catalog row.
-        rows = _encode_points(int(MetricType.FLOAT), pending)
+        rows = _encode_points(int(MetricType.FLOAT), points)
         metric = storage.ensure_virtual_metric(
             address,
             metric_id,
@@ -111,23 +254,29 @@ def import_virtual_readings(
             metric_type=int(MetricType.FLOAT),
         )
     else:
-        present = storage.sample_timestamps_present(
-            address, metric_id, [point.ts for point in points]
-        )
-        pending = [point for point in points if point.ts not in present]
-        skipped = len(points) - len(pending)
-        rows = _encode_points(metric.type, pending)
+        rows = _encode_points(metric.type, points)
+    return path, metric, rows
 
-    inserted = storage.insert_reading_rows(address, metric_id, rows)
-    return {
+
+def _summary(
+    metric: MetricCatalogRow,
+    path: Path,
+    *,
+    inserted: int,
+    skipped: int,
+    **extra: Any,
+) -> dict[str, Any]:
+    result = {
         "inserted_samples": inserted,
         "skipped_samples": skipped,
-        "address": address,
-        "metric_id": metric_id,
+        "address": metric.address,
+        "metric_id": metric.metric_id,
         "metric_name": metric.name,
         "metric_type": metric.type,
         "input": str(path),
     }
+    result.update(extra)
+    return result
 
 
 def _encode_points(

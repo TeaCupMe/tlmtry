@@ -3,7 +3,10 @@
 
 Each line is ``unix_time; value;``. Readings are inserted into ``samples`` for
 one device address and metric. A timestamp already stored for that metric is
-skipped. Stdout is one JSON object with inserted_samples and skipped_samples.
+skipped.
+
+``--every SECONDS`` writes one row at a time and runs until SIGINT or SIGTERM.
+``--once`` writes every pending row and exits. Stdout is one JSON object.
 """
 
 from __future__ import annotations
@@ -11,7 +14,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import signal
 import sys
+import threading
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -21,7 +26,10 @@ if _COLLECTOR.is_dir():
 
 from tlmtry_collector.config import load_config  # noqa: E402
 from tlmtry_collector.storage import Storage  # noqa: E402
-from tlmtry_collector.virtual_readings import import_virtual_readings  # noqa: E402
+from tlmtry_collector.virtual_readings import (  # noqa: E402
+    follow_virtual_readings,
+    import_virtual_readings,
+)
 
 
 def _database(args: argparse.Namespace) -> str:
@@ -77,6 +85,21 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Unit used only when --create-virtual inserts a new metric",
     )
+    pace = parser.add_mutually_exclusive_group(required=True)
+    pace.add_argument(
+        "--every",
+        type=float,
+        metavar="SECONDS",
+        help=(
+            "Write the next CSV row every SECONDS and run until stopped. "
+            "The first pending row is written immediately"
+        ),
+    )
+    pace.add_argument(
+        "--once",
+        action="store_true",
+        help="Write every pending CSV row in one pass and exit",
+    )
     return parser
 
 
@@ -90,16 +113,38 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     try:
-        result = import_virtual_readings(
-            dest,
-            args.input,
-            args.address,
-            args.metric_id,
-            create_virtual=args.create_virtual,
-            device_name=args.device_name,
-            metric_name=args.metric_name,
-            unit=args.unit,
-        )
+        if args.once:
+            result = import_virtual_readings(
+                dest,
+                args.input,
+                args.address,
+                args.metric_id,
+                create_virtual=args.create_virtual,
+                device_name=args.device_name,
+                metric_name=args.metric_name,
+                unit=args.unit,
+            )
+        else:
+            stop = threading.Event()
+
+            def _handle_signal(signum: int, frame: object) -> None:  # noqa: ARG001
+                logging.getLogger(__name__).info("signal %s received, stopping", signum)
+                stop.set()
+
+            signal.signal(signal.SIGINT, _handle_signal)
+            signal.signal(signal.SIGTERM, _handle_signal)
+            result = follow_virtual_readings(
+                dest,
+                args.input,
+                args.address,
+                args.metric_id,
+                args.every,
+                create_virtual=args.create_virtual,
+                device_name=args.device_name,
+                metric_name=args.metric_name,
+                unit=args.unit,
+                stop=stop,
+            )
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

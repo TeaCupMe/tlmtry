@@ -17,6 +17,7 @@ from tlmtry_collector.protocol import (
 from tlmtry_collector.storage import Storage
 from tlmtry_collector.virtual_readings import (
     ReadingsFileError,
+    follow_virtual_readings,
     import_virtual_readings,
     parse_readings_csv,
 )
@@ -225,6 +226,7 @@ def test_script_imports_csv(tmp_path: Path):
             "--metric-id",
             "0",
             "--create-virtual",
+            "--once",
             "--input",
             str(csv_path),
         ],
@@ -270,6 +272,164 @@ def test_repeat_import_skips_existing_timestamps(tmp_path: Path):
         assert second["inserted_samples"] == 0
         assert second["skipped_samples"] == 2
         assert db.sample_count() == 3
+    finally:
+        db.close()
+
+
+def test_follow_writes_one_row_per_interval_until_stopped(tmp_path: Path):
+    db = Storage(tmp_path / "primary.db")
+    _seed(db)
+    csv_path = tmp_path / "readings.csv"
+    csv_path.write_text("1000; 21,5;\n1001; 22;\n1002; 23;\n", encoding="utf-8")
+    waits: list[float | None] = []
+
+    def wait(seconds: float | None) -> bool:
+        waits.append(seconds)
+        return seconds is not None
+
+    try:
+        result = follow_virtual_readings(db, csv_path, 1, 0, 5, wait=wait)
+        assert result["inserted_samples"] == 1
+        assert result["skipped_samples"] == 0
+        assert result["remaining_samples"] == 2
+        assert result["stopped"] is True
+        assert waits == [5]
+        stored = [row for row in db.iter_samples_after(0) if row.ts == 1000]
+        assert stored[0].value_real == 21.5
+        assert db.sample_count() == 2
+    finally:
+        db.close()
+
+
+def test_follow_skips_stored_rows_without_waiting(tmp_path: Path):
+    db = Storage(tmp_path / "primary.db")
+    _seed(db)
+    csv_path = tmp_path / "readings.csv"
+    csv_path.write_text("1000; 21;\n1001; 22;\n1002; 23;\n", encoding="utf-8")
+    import_virtual_readings(db, csv_path, 1, 0)
+    waits: list[float | None] = []
+
+    def wait(seconds: float | None) -> bool:
+        waits.append(seconds)
+        return False
+
+    try:
+        before = db.sample_count()
+        result = follow_virtual_readings(db, csv_path, 1, 0, 5, wait=wait)
+        assert result["inserted_samples"] == 0
+        assert result["skipped_samples"] == 3
+        assert result["remaining_samples"] == 0
+        assert waits == [None]
+        assert db.sample_count() == before
+    finally:
+        db.close()
+
+
+def test_follow_waits_after_the_file_is_loaded(tmp_path: Path):
+    db = Storage(tmp_path / "primary.db")
+    _seed(db)
+    csv_path = tmp_path / "readings.csv"
+    csv_path.write_text("1000; 21;\n1001; 22;\n", encoding="utf-8")
+    waits: list[float | None] = []
+
+    def wait(seconds: float | None) -> bool:
+        waits.append(seconds)
+        return False
+
+    try:
+        result = follow_virtual_readings(db, csv_path, 1, 0, 2.5, wait=wait)
+        assert result["inserted_samples"] == 2
+        assert result["remaining_samples"] == 0
+        assert waits == [2.5, None]
+        loaded = [
+            (row.ts, row.value_real)
+            for row in db.iter_samples_after(0)
+            if row.ts in (1000.0, 1001.0)
+        ]
+        assert loaded == [(1000.0, 21.0), (1001.0, 22.0)]
+    finally:
+        db.close()
+
+
+def test_follow_rejects_bad_interval_and_bad_values(tmp_path: Path):
+    db = Storage(tmp_path / "primary.db")
+    _seed(db)
+    csv_path = tmp_path / "bad.csv"
+    csv_path.write_text("1000; 1;\n1001; 2;\n", encoding="utf-8")
+    called = False
+
+    def wait(seconds: float | None) -> bool:
+        nonlocal called
+        called = True
+        return True
+
+    try:
+        with pytest.raises(ValueError, match="every"):
+            follow_virtual_readings(db, csv_path, 1, 1, 0, wait=wait)
+        before = db.sample_count()
+        with pytest.raises(ReadingsFileError, match="line 2"):
+            follow_virtual_readings(db, csv_path, 1, 1, 1, wait=wait)
+        assert db.sample_count() == before
+        assert called is False
+    finally:
+        db.close()
+
+
+def test_script_stops_before_loading_the_rest(tmp_path: Path):
+    import signal
+    import time
+
+    db_path = tmp_path / "primary.db"
+    csv_path = tmp_path / "readings.csv"
+    csv_path.write_text("1710000000; 21,5;\n1710000060; 22;\n", encoding="utf-8")
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(ROOT / "collector")
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--database",
+            str(db_path),
+            "--address",
+            "101",
+            "--metric-id",
+            "0",
+            "--create-virtual",
+            "--every",
+            "60",
+            "--input",
+            str(csv_path),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    deadline = time.time() + 15
+    seen = False
+    while time.time() < deadline:
+        if db_path.exists():
+            db = Storage(db_path)
+            try:
+                seen = db.sample_count() >= 1
+            finally:
+                db.close()
+            if seen:
+                break
+        if proc.poll() is not None:
+            break
+        time.sleep(0.05)
+    proc.send_signal(signal.SIGTERM)
+    stdout, stderr = proc.communicate(timeout=10)
+    assert proc.returncode == 0, stderr
+    assert seen, stderr
+    body = json.loads(stdout)
+    assert body["inserted_samples"] == 1
+    assert body["remaining_samples"] == 1
+    db = Storage(db_path)
+    try:
+        rows = db.iter_samples_after(0)
+        assert [(row.ts, row.value_real) for row in rows] == [(1710000000.0, 21.5)]
     finally:
         db.close()
 
