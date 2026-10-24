@@ -9,12 +9,14 @@ Readings are stored like polled samples and are picked up by replication.
 They do not mark the device online. ``last_seen`` moves only forward.
 
 ``import_virtual_readings`` writes the whole file in one transaction.
-``follow_virtual_readings`` writes one row every ``every`` seconds and keeps
-running until stopped. Each row keeps the ``unix_time`` and value from the file.
+``follow_virtual_readings`` writes a sample every ``every`` seconds until
+stopped. CSV rows are the moments when the value changes; between them the
+previous value is held.
 """
 
 from __future__ import annotations
 
+import bisect
 import logging
 import math
 import threading
@@ -126,12 +128,14 @@ def follow_virtual_readings(
     stop: threading.Event | None = None,
     wait: WaitFn | None = None,
 ) -> dict[str, Any]:
-    """Insert one CSV row every ``every`` seconds until ``stop`` is set.
+    """Write one sample every ``every`` seconds until ``stop`` is set.
 
-    The first row that is not already stored is written immediately. Each
-    later row waits ``every`` seconds. A timestamp already in the database is
-    skipped without waiting, so a restarted process continues the file.
-    After the last row the call waits until stopped and writes nothing more.
+    Samples start at the earliest CSV timestamp and then step by ``every``.
+    Each sample takes the value of the latest CSV point at or before its
+    timestamp. After the last file point that value is held. The first missing
+    sample is written immediately; each later sample waits ``every`` seconds.
+    A restarted process continues after the last sample already stored on this
+    grid.
     """
     if not math.isfinite(every) or every <= 0:
         raise ValueError("every must be a positive number of seconds")
@@ -154,28 +158,25 @@ def follow_virtual_readings(
         metric_name=metric_name,
         unit=unit,
     )
-    present = storage.sample_timestamps_present(
-        address, metric_id, [ts for ts, _, _, _ in rows]
-    )
+    if not rows:
+        raise ReadingsFileError("CSV file has no readings")
+    times, values = _hold_series(rows)
+    start = times[0]
+    step = _first_missing_step(storage, address, metric_id, start, every)
     inserted = 0
-    skipped = 0
-    index = 0
     stopped = False
-    while index < len(rows):
+    while True:
         if stop.is_set():
             stopped = True
             break
-        ts, value_real, value_text, metric_type = rows[index]
-        index += 1
-        if ts in present:
-            skipped += 1
-            continue
+        ts = start + step * every
+        held = _held_value(times, values, ts)
+        value_real, value_text = _encode_value(metric.type, held)
         storage.insert_reading_rows(
             address,
             metric_id,
-            [(ts, value_real, value_text, metric_type)],
+            [(ts, value_real, value_text, metric.type)],
         )
-        present.add(ts)
         inserted += 1
         shown = value_real if value_real is not None else value_text
         log.info(
@@ -185,29 +186,19 @@ def follow_virtual_readings(
             ts,
             shown,
         )
-        if index >= len(rows):
-            break
+        step += 1
         if stop.is_set() or wait(every):
             stopped = True
             break
-
-    if not stopped and not stop.is_set():
-        log.info(
-            "csv readings loaded inserted=%s skipped=%s; waiting until stop",
-            inserted,
-            skipped,
-        )
-        wait(None)
-        stopped = True
 
     return _summary(
         metric,
         path,
         inserted=inserted,
-        skipped=skipped,
-        remaining_samples=len(rows) - index,
+        skipped=step - inserted,
         every=every,
         stopped=stopped or stop.is_set(),
+        next_ts=start + step * every,
     )
 
 
@@ -277,6 +268,58 @@ def _summary(
     }
     result.update(extra)
     return result
+
+
+def _hold_series(
+    rows: list[tuple[float, float | None, str | None, int]],
+) -> tuple[list[float], list[float]]:
+    """CSV points sorted by time. A repeated timestamp keeps the later value."""
+    ordered = sorted(rows, key=lambda row: row[0])
+    times: list[float] = []
+    values: list[float] = []
+    for ts, value_real, _value_text, _metric_type in ordered:
+        if value_real is None:
+            raise ReadingsFileError(f"reading at {ts} has no numeric value")
+        times.append(float(ts))
+        values.append(float(value_real))
+    return times, values
+
+
+def _held_value(times: list[float], values: list[float], ts: float) -> float:
+    index = bisect.bisect_right(times, ts) - 1
+    if index < 0:
+        index = 0
+    return values[index]
+
+
+def _first_missing_step(
+    storage: Storage,
+    address: int,
+    metric_id: int,
+    start: float,
+    every: float,
+) -> int:
+    """Index of the first ``start + n * every`` sample that is not stored yet."""
+
+    def exists(step: int) -> bool:
+        ts = start + step * every
+        return bool(storage.sample_timestamps_present(address, metric_id, [ts]))
+
+    if not exists(0):
+        return 0
+    hi = 1
+    while exists(hi):
+        if hi >= 2**52:
+            return hi
+        hi *= 2
+    lo = hi // 2
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        if exists(mid):
+            lo = mid
+        else:
+            hi = mid
+    return hi
 
 
 def _encode_points(

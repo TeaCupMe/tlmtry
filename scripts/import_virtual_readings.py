@@ -5,8 +5,10 @@ Each line is ``unix_time; value;``. Readings are inserted into ``samples`` for
 one device address and metric. A timestamp already stored for that metric is
 skipped.
 
-``--every SECONDS`` writes one row at a time and runs until SIGINT or SIGTERM.
-``--once`` writes every pending row and exits. Stdout is one JSON object.
+``--every SECONDS`` writes a sample at that interval and runs until SIGINT or
+SIGTERM. CSV rows set the value at those timestamps; the previous value is
+held in between. ``--once`` writes every CSV row and exits. Stdout is one
+JSON object.
 """
 
 from __future__ import annotations
@@ -91,8 +93,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         metavar="SECONDS",
         help=(
-            "Write the next CSV row every SECONDS and run until stopped. "
-            "The first pending row is written immediately"
+            "Write a sample every SECONDS and run until stopped. "
+            "CSV rows change the held value; between them the last value is kept"
         ),
     )
     pace.add_argument(

@@ -276,77 +276,108 @@ def test_repeat_import_skips_existing_timestamps(tmp_path: Path):
         db.close()
 
 
-def test_follow_writes_one_row_per_interval_until_stopped(tmp_path: Path):
-    db = Storage(tmp_path / "primary.db")
-    _seed(db)
-    csv_path = tmp_path / "readings.csv"
-    csv_path.write_text("1000; 21,5;\n1001; 22;\n1002; 23;\n", encoding="utf-8")
+def _follow_until(limit: int):
     waits: list[float | None] = []
 
     def wait(seconds: float | None) -> bool:
         waits.append(seconds)
-        return seconds is not None
+        return len(waits) >= limit
 
+    return waits, wait
+
+
+def test_follow_holds_value_between_file_points(tmp_path: Path):
+    db = Storage(tmp_path / "primary.db")
+    csv_path = tmp_path / "readings.csv"
+    csv_path.write_text(
+        "1012; 30;\n1000; 21,5;\n1000; 21;\n",
+        encoding="utf-8",
+    )
+    waits, wait = _follow_until(5)
     try:
-        result = follow_virtual_readings(db, csv_path, 1, 0, 5, wait=wait)
-        assert result["inserted_samples"] == 1
+        result = follow_virtual_readings(
+            db,
+            csv_path,
+            101,
+            0,
+            5,
+            create_virtual=True,
+            wait=wait,
+        )
+        assert result["inserted_samples"] == 5
         assert result["skipped_samples"] == 0
-        assert result["remaining_samples"] == 2
-        assert result["stopped"] is True
-        assert waits == [5]
-        stored = [row for row in db.iter_samples_after(0) if row.ts == 1000]
-        assert stored[0].value_real == 21.5
-        assert db.sample_count() == 2
+        assert result["next_ts"] == 1025
+        assert waits == [5, 5, 5, 5, 5]
+        stored = [(row.ts, row.value_real) for row in db.iter_samples_after(0)]
+        assert stored == [
+            (1000.0, 21.0),
+            (1005.0, 21.0),
+            (1010.0, 21.0),
+            (1015.0, 30.0),
+            (1020.0, 30.0),
+        ]
     finally:
         db.close()
 
 
-def test_follow_skips_stored_rows_without_waiting(tmp_path: Path):
+def test_follow_keeps_last_value_after_the_file(tmp_path: Path):
+    db = Storage(tmp_path / "primary.db")
+    csv_path = tmp_path / "readings.csv"
+    csv_path.write_text("1000; 5;\n1010; 9;\n", encoding="utf-8")
+    _waits, wait = _follow_until(4)
+    try:
+        follow_virtual_readings(
+            db, csv_path, 101, 0, 5, create_virtual=True, wait=wait
+        )
+        stored = [(row.ts, row.value_real) for row in db.iter_samples_after(0)]
+        assert stored == [
+            (1000.0, 5.0),
+            (1005.0, 5.0),
+            (1010.0, 9.0),
+            (1015.0, 9.0),
+        ]
+    finally:
+        db.close()
+
+
+def test_follow_resumes_on_the_next_grid_step(tmp_path: Path):
+    db = Storage(tmp_path / "primary.db")
+    csv_path = tmp_path / "readings.csv"
+    csv_path.write_text("1000; 5;\n1030; 8;\n", encoding="utf-8")
+    _waits, wait = _follow_until(3)
+    try:
+        first = follow_virtual_readings(
+            db, csv_path, 101, 0, 5, create_virtual=True, wait=wait
+        )
+        assert first["inserted_samples"] == 3
+        again_waits, again_wait = _follow_until(1)
+        second = follow_virtual_readings(
+            db, csv_path, 101, 0, 5, create_virtual=True, wait=again_wait
+        )
+        assert second["inserted_samples"] == 1
+        assert second["skipped_samples"] == 3
+        assert again_waits == [5]
+        stored = [(row.ts, row.value_real) for row in db.iter_samples_after(0)]
+        assert stored == [
+            (1000.0, 5.0),
+            (1005.0, 5.0),
+            (1010.0, 5.0),
+            (1015.0, 5.0),
+        ]
+    finally:
+        db.close()
+
+
+def test_follow_empty_file_writes_nothing(tmp_path: Path):
     db = Storage(tmp_path / "primary.db")
     _seed(db)
-    csv_path = tmp_path / "readings.csv"
-    csv_path.write_text("1000; 21;\n1001; 22;\n1002; 23;\n", encoding="utf-8")
-    import_virtual_readings(db, csv_path, 1, 0)
-    waits: list[float | None] = []
-
-    def wait(seconds: float | None) -> bool:
-        waits.append(seconds)
-        return False
-
+    csv_path = tmp_path / "empty.csv"
+    csv_path.write_text("# nothing\n", encoding="utf-8")
     try:
         before = db.sample_count()
-        result = follow_virtual_readings(db, csv_path, 1, 0, 5, wait=wait)
-        assert result["inserted_samples"] == 0
-        assert result["skipped_samples"] == 3
-        assert result["remaining_samples"] == 0
-        assert waits == [None]
+        with pytest.raises(ReadingsFileError, match="no readings"):
+            follow_virtual_readings(db, csv_path, 1, 0, 5, wait=lambda _seconds: True)
         assert db.sample_count() == before
-    finally:
-        db.close()
-
-
-def test_follow_waits_after_the_file_is_loaded(tmp_path: Path):
-    db = Storage(tmp_path / "primary.db")
-    _seed(db)
-    csv_path = tmp_path / "readings.csv"
-    csv_path.write_text("1000; 21;\n1001; 22;\n", encoding="utf-8")
-    waits: list[float | None] = []
-
-    def wait(seconds: float | None) -> bool:
-        waits.append(seconds)
-        return False
-
-    try:
-        result = follow_virtual_readings(db, csv_path, 1, 0, 2.5, wait=wait)
-        assert result["inserted_samples"] == 2
-        assert result["remaining_samples"] == 0
-        assert waits == [2.5, None]
-        loaded = [
-            (row.ts, row.value_real)
-            for row in db.iter_samples_after(0)
-            if row.ts in (1000.0, 1001.0)
-        ]
-        assert loaded == [(1000.0, 21.0), (1001.0, 22.0)]
     finally:
         db.close()
 
@@ -425,7 +456,7 @@ def test_script_stops_before_loading_the_rest(tmp_path: Path):
     assert seen, stderr
     body = json.loads(stdout)
     assert body["inserted_samples"] == 1
-    assert body["remaining_samples"] == 1
+    assert body["next_ts"] == 1710000060.0
     db = Storage(db_path)
     try:
         rows = db.iter_samples_after(0)
