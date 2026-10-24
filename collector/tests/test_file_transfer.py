@@ -120,6 +120,21 @@ def test_export_without_new_samples_keeps_from_id(tmp_path: Path):
     assert len(payload["devices"]) == 1
 
 
+def test_export_limit_bounds_a_replication_batch(tmp_path: Path):
+    primary = Storage(tmp_path / "primary.db")
+    _seed(primary)
+    batch = tmp_path / "limited.json"
+    try:
+        exported = export_since(primary, 1, batch, limit=2)
+    finally:
+        primary.close()
+    payload = json.loads(batch.read_text(encoding="utf-8"))
+    assert exported["exported_samples"] == 2
+    assert exported["max_id"] == 2
+    assert exported["next_from_id"] == 3
+    assert [row["id"] for row in payload["samples"]] == [1, 2]
+
+
 def test_rejects_bad_file_and_missing_directory(tmp_path: Path):
     primary = Storage(tmp_path / "primary.db")
     _seed(primary)
