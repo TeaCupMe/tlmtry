@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from pathlib import Path
 from typing import Any
@@ -48,7 +49,13 @@ class ReplicationFileError(ValueError):
     """The replication file is missing, unreadable, or does not match the format."""
 
 
-def export_since(source: Storage, from_id: int, output: str | Path) -> dict[str, Any]:
+def export_since(
+    source: Storage,
+    from_id: int,
+    output: str | Path,
+    *,
+    limit: int | None = None,
+) -> dict[str, Any]:
     """Write the catalog and samples with ``id >= from_id`` to ``output``.
 
     Does not read or update the source replication watermark. The caller keeps
@@ -58,7 +65,7 @@ def export_since(source: Storage, from_id: int, output: str | Path) -> dict[str,
     path = Path(output)
     _require_output_path(path)
 
-    rows = source.iter_samples_after(start - 1)
+    rows = source.iter_samples_after(start - 1, limit=limit)
     devices = source.list_devices()
     metrics = source.list_metrics()
     max_id = max((row.id for row in rows), default=None)
@@ -235,7 +242,7 @@ def _device_json(row: DeviceRow) -> dict[str, Any]:
         "fw_major": row.fw_major,
         "fw_minor": row.fw_minor,
         "poll_interval_ms": row.poll_interval_ms,
-        "last_seen": row.last_seen,
+        "last_seen": _optional_finite_float(row.last_seen),
         "online": row.online,
         "last_error": row.last_error,
     }
@@ -252,16 +259,25 @@ def _metric_json(row: MetricCatalogRow) -> dict[str, Any]:
 
 
 def _sample_json(row: SampleRow) -> dict[str, Any]:
+    if not math.isfinite(row.ts):
+        raise ReplicationFileError(f"sample {row.id} has a non-finite timestamp")
     return {
         "id": row.id,
         "address": row.address,
         "metric_id": row.metric_id,
         "ts": row.ts,
-        "value_real": row.value_real,
+        "value_real": _optional_finite_float(row.value_real),
         "value_text": row.value_text,
         "type": row.type,
         "quality": row.quality,
     }
+
+
+def _optional_finite_float(value: float | None) -> float | None:
+    """JSON has no NaN/Infinity; map invalid optional measurements to SQL NULL."""
+    if value is None:
+        return None
+    return float(value) if math.isfinite(value) else None
 
 
 def _device_row(value: Any) -> DeviceRow:

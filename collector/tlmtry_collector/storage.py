@@ -166,10 +166,10 @@ class MetricCatalogRow:
 
 
 class Storage:
-    def __init__(self, database: str | Path) -> None:
+    def __init__(self, database: str | Path, *, initialize_schema: bool = True) -> None:
         self._database = str(database)
         if is_postgres_dsn(self._database):
-            self._init_postgres(self._database)
+            self._init_postgres(self._database, initialize_schema=initialize_schema)
         else:
             self._init_sqlite(self._database)
 
@@ -182,7 +182,7 @@ class Storage:
         self._conn.executescript(SQLITE_SCHEMA)
         self._conn.commit()
 
-    def _init_postgres(self, dsn: str) -> None:
+    def _init_postgres(self, dsn: str, *, initialize_schema: bool = True) -> None:
         try:
             import psycopg
             from psycopg.rows import dict_row
@@ -196,6 +196,8 @@ class Storage:
         # Keep path as a Path-like display token for callers that stringify it.
         self.path = Path(mask_database_url(dsn))
         self._conn = psycopg.connect(dsn, row_factory=dict_row, autocommit=False)
+        if not initialize_schema:
+            return
         statements = [s.strip() for s in POSTGRES_SCHEMA.split(";") if s.strip()]
         with self._conn.cursor() as cur:
             for statement in statements:
@@ -430,14 +432,18 @@ class Storage:
                 (key, str(value)),
             )
 
-    def iter_samples_after(self, after_id: int) -> list[SampleRow]:
-        rows = self._fetchall(
-            """
+    def iter_samples_after(self, after_id: int, limit: int | None = None) -> list[SampleRow]:
+        query = """
             SELECT id, address, metric_id, ts, value_real, value_text, type, quality
             FROM samples WHERE id > ? ORDER BY id
-            """,
-            (after_id,),
-        )
+        """
+        params: tuple[object, ...] = (after_id,)
+        if limit is not None:
+            if isinstance(limit, bool) or limit < 1:
+                raise ValueError("limit must be a positive integer")
+            query += " LIMIT ?"
+            params += (int(limit),)
+        rows = self._fetchall(query, params)
         return [
             SampleRow(
                 id=int(self._row_get(r, "id")),
