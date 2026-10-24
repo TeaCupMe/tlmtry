@@ -70,8 +70,8 @@ class Bus:
     def __init__(
         self,
         transport: ByteTransport,
-        response_timeout_s: float = 0.2,
-        probe_timeout_s: float = 0.05,
+        response_timeout_s: float = 0.5,
+        probe_timeout_s: float = 0.3,
         inter_frame_gap_s: float = 0.01,
     ) -> None:
         self.transport = transport
