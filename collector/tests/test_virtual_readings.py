@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -16,6 +17,7 @@ from tlmtry_collector.protocol import (
 )
 from tlmtry_collector.storage import Storage
 from tlmtry_collector.virtual_readings import (
+    JITTER_PERIOD_STEPS,
     ReadingsFileError,
     follow_virtual_readings,
     import_virtual_readings,
@@ -364,6 +366,93 @@ def test_follow_resumes_on_the_next_grid_step(tmp_path: Path):
             (1010.0, 5.0),
             (1015.0, 5.0),
         ]
+    finally:
+        db.close()
+
+
+def _jittered(value: float, step: int, amplitude: float) -> float:
+    phase = 2 * math.pi * (step + 0.5) / JITTER_PERIOD_STEPS
+    return value + amplitude * math.sin(phase)
+
+
+def test_follow_jitter_wobbles_around_the_held_value(tmp_path: Path):
+    db = Storage(tmp_path / "primary.db")
+    csv_path = tmp_path / "readings.csv"
+    csv_path.write_text("1000; 10;\n1020; 14;\n", encoding="utf-8")
+    amplitude = 0.2
+    _waits, wait = _follow_until(5)
+    try:
+        result = follow_virtual_readings(
+            db,
+            csv_path,
+            101,
+            0,
+            5,
+            create_virtual=True,
+            wait=wait,
+            jitter=amplitude,
+        )
+        assert result["jitter"] == amplitude
+        stored = [(row.ts, row.value_real) for row in db.iter_samples_after(0)]
+        expected = [
+            (1000.0, _jittered(10.0, 0, amplitude)),
+            (1005.0, _jittered(10.0, 1, amplitude)),
+            (1010.0, _jittered(10.0, 2, amplitude)),
+            (1015.0, _jittered(10.0, 3, amplitude)),
+            (1020.0, _jittered(14.0, 4, amplitude)),
+        ]
+        assert [ts for ts, _value in stored] == [ts for ts, _value in expected]
+        held = (10.0, 10.0, 10.0, 10.0, 14.0)
+        for (_ts, actual), (_expected_ts, wanted), base in zip(stored, expected, held):
+            assert actual == pytest.approx(wanted)
+            assert actual != base
+            assert abs(actual - base) <= amplitude
+    finally:
+        db.close()
+
+
+def test_follow_jitter_resumes_the_same_wave(tmp_path: Path):
+    db = Storage(tmp_path / "primary.db")
+    csv_path = tmp_path / "readings.csv"
+    csv_path.write_text("1000; 10;\n", encoding="utf-8")
+    amplitude = 0.5
+    _waits, wait = _follow_until(2)
+    try:
+        follow_virtual_readings(
+            db, csv_path, 101, 0, 5, create_virtual=True, wait=wait, jitter=amplitude
+        )
+        _again, again_wait = _follow_until(1)
+        follow_virtual_readings(
+            db, csv_path, 101, 0, 5, create_virtual=True, wait=again_wait, jitter=amplitude
+        )
+        stored = [row.value_real for row in db.iter_samples_after(0)]
+        assert stored == pytest.approx(
+            [_jittered(10.0, step, amplitude) for step in range(3)]
+        )
+    finally:
+        db.close()
+
+
+def test_follow_jitter_rejects_non_float_and_bad_amplitude(tmp_path: Path):
+    db = Storage(tmp_path / "primary.db")
+    _seed(db)
+    csv_path = tmp_path / "flags.csv"
+    csv_path.write_text("1000; 1;\n", encoding="utf-8")
+    called = False
+
+    def wait(seconds: float | None) -> bool:
+        nonlocal called
+        called = True
+        return True
+
+    try:
+        with pytest.raises(ValueError, match="jitter amplitude"):
+            follow_virtual_readings(db, csv_path, 1, 0, 5, jitter=0, wait=wait)
+        before = db.sample_count()
+        with pytest.raises(ValueError, match="float"):
+            follow_virtual_readings(db, csv_path, 1, 1, 5, jitter=0.1, wait=wait)
+        assert db.sample_count() == before
+        assert called is False
     finally:
         db.close()
 

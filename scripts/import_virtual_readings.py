@@ -7,8 +7,8 @@ skipped.
 
 ``--every SECONDS`` writes a sample at that interval and runs until SIGINT or
 SIGTERM. CSV rows set the value at those timestamps; the previous value is
-held in between. ``--once`` writes every CSV row and exits. Stdout is one
-JSON object.
+held in between. ``--jitter`` adds a small sine around that value.
+``--once`` writes every CSV row and exits. Stdout is one JSON object.
 """
 
 from __future__ import annotations
@@ -102,6 +102,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Write every pending CSV row in one pass and exit",
     )
+    parser.add_argument(
+        "--jitter",
+        type=float,
+        metavar="AMPLITUDE",
+        help=(
+            "Peak amplitude of a sine added to each interval sample. "
+            "Float metrics only. A full cycle is 12 steps"
+        ),
+    )
     return parser
 
 
@@ -109,6 +118,9 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     args = build_parser().parse_args(argv)
     database = _database(args)
+    if args.jitter is not None and args.once:
+        print("error: --jitter requires --every", file=sys.stderr)
+        return 2
     try:
         dest = Storage(database)
     except Exception as exc:
@@ -146,6 +158,7 @@ def main(argv: list[str] | None = None) -> int:
                 metric_name=args.metric_name,
                 unit=args.unit,
                 stop=stop,
+                jitter=args.jitter,
             )
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)

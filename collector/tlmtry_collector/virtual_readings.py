@@ -11,7 +11,7 @@ They do not mark the device online. ``last_seen`` moves only forward.
 ``import_virtual_readings`` writes the whole file in one transaction.
 ``follow_virtual_readings`` writes a sample every ``every`` seconds until
 stopped. CSV rows are the moments when the value changes; between them the
-previous value is held.
+previous value is held. Optional jitter adds a small sine around that value.
 """
 
 from __future__ import annotations
@@ -29,6 +29,10 @@ from .protocol import MetricType
 from .storage import MetricCatalogRow, Storage
 
 log = logging.getLogger(__name__)
+
+# One full wobble per this many interval steps. The phase is offset by half a
+# step so a grid sample is not exactly the CSV value.
+JITTER_PERIOD_STEPS = 12
 
 # Seconds to wait. None waits until stop. Return True when stop was requested.
 WaitFn = Callable[[float | None], bool]
@@ -127,6 +131,7 @@ def follow_virtual_readings(
     unit: str = "",
     stop: threading.Event | None = None,
     wait: WaitFn | None = None,
+    jitter: float | None = None,
 ) -> dict[str, Any]:
     """Write one sample every ``every`` seconds until ``stop`` is set.
 
@@ -136,9 +141,14 @@ def follow_virtual_readings(
     sample is written immediately; each later sample waits ``every`` seconds.
     A restarted process continues after the last sample already stored on this
     grid.
+
+    ``jitter`` is the peak amplitude of a sine added to the held value. It is
+    only applied to float metrics. ``None`` stores the CSV value unchanged.
     """
     if not math.isfinite(every) or every <= 0:
         raise ValueError("every must be a positive number of seconds")
+    if jitter is not None and (not math.isfinite(jitter) or jitter <= 0):
+        raise ValueError("jitter amplitude must be a positive number")
     if stop is None:
         stop = threading.Event()
     if wait is None:
@@ -160,6 +170,8 @@ def follow_virtual_readings(
     )
     if not rows:
         raise ReadingsFileError("CSV file has no readings")
+    if jitter is not None and metric.type != int(MetricType.FLOAT):
+        raise ValueError("jitter is only supported for float metrics")
     times, values = _hold_series(rows)
     start = times[0]
     step = _first_missing_step(storage, address, metric_id, start, every)
@@ -171,6 +183,8 @@ def follow_virtual_readings(
             break
         ts = start + step * every
         held = _held_value(times, values, ts)
+        if jitter is not None:
+            held = _jittered(held, step, jitter)
         value_real, value_text = _encode_value(metric.type, held)
         storage.insert_reading_rows(
             address,
@@ -191,6 +205,9 @@ def follow_virtual_readings(
             stopped = True
             break
 
+    extra: dict[str, Any] = {}
+    if jitter is not None:
+        extra["jitter"] = jitter
     return _summary(
         metric,
         path,
@@ -199,6 +216,7 @@ def follow_virtual_readings(
         every=every,
         stopped=stopped or stop.is_set(),
         next_ts=start + step * every,
+        **extra,
     )
 
 
@@ -283,6 +301,11 @@ def _hold_series(
         times.append(float(ts))
         values.append(float(value_real))
     return times, values
+
+
+def _jittered(value: float, step: int, amplitude: float) -> float:
+    phase = 2 * math.pi * (step + 0.5) / JITTER_PERIOD_STEPS
+    return value + amplitude * math.sin(phase)
 
 
 def _held_value(times: list[float], values: list[float], ts: float) -> float:
