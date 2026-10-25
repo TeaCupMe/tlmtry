@@ -7,7 +7,7 @@ skipped.
 
 ``--every SECONDS`` writes a sample at that interval and runs until SIGINT or
 SIGTERM. CSV rows set the value at those timestamps; the previous value is
-held in between. ``--jitter`` adds a small sine around that value.
+held in between. ``--jitter`` adds a little noise around that value.
 ``--once`` writes every CSV row and exits. Stdout is one JSON object.
 """
 
@@ -107,8 +107,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         metavar="AMPLITUDE",
         help=(
-            "Peak amplitude of a sine added to each interval sample. "
-            "Float metrics only. A full cycle is 12 steps"
+            "Add noise of this amplitude around each interval sample. "
+            "Float metrics only. Every sample stays within ±AMPLITUDE of the CSV value"
         ),
     )
     return parser

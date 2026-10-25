@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 import subprocess
 import sys
@@ -17,8 +16,8 @@ from tlmtry_collector.protocol import (
 )
 from tlmtry_collector.storage import Storage
 from tlmtry_collector.virtual_readings import (
-    JITTER_PERIOD_STEPS,
     ReadingsFileError,
+    _jittered,
     follow_virtual_readings,
     import_virtual_readings,
     parse_readings_csv,
@@ -370,11 +369,6 @@ def test_follow_resumes_on_the_next_grid_step(tmp_path: Path):
         db.close()
 
 
-def _jittered(value: float, step: int, amplitude: float) -> float:
-    phase = 2 * math.pi * (step + 0.5) / JITTER_PERIOD_STEPS
-    return value + amplitude * math.sin(phase)
-
-
 def test_follow_jitter_wobbles_around_the_held_value(tmp_path: Path):
     db = Storage(tmp_path / "primary.db")
     csv_path = tmp_path / "readings.csv"
@@ -403,10 +397,13 @@ def test_follow_jitter_wobbles_around_the_held_value(tmp_path: Path):
         ]
         assert [ts for ts, _value in stored] == [ts for ts, _value in expected]
         held = (10.0, 10.0, 10.0, 10.0, 14.0)
+        offsets = []
         for (_ts, actual), (_expected_ts, wanted), base in zip(stored, expected, held):
             assert actual == pytest.approx(wanted)
             assert actual != base
             assert abs(actual - base) <= amplitude
+            offsets.append(actual - base)
+        assert len(set(round(offset, 6) for offset in offsets)) == len(offsets)
     finally:
         db.close()
 

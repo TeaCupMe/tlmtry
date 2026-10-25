@@ -11,7 +11,7 @@ They do not mark the device online. ``last_seen`` moves only forward.
 ``import_virtual_readings`` writes the whole file in one transaction.
 ``follow_virtual_readings`` writes a sample every ``every`` seconds until
 stopped. CSV rows are the moments when the value changes; between them the
-previous value is held. Optional jitter adds a small sine around that value.
+previous value is held. Optional jitter adds a little noise around that value.
 """
 
 from __future__ import annotations
@@ -29,10 +29,6 @@ from .protocol import MetricType
 from .storage import MetricCatalogRow, Storage
 
 log = logging.getLogger(__name__)
-
-# One full wobble per this many interval steps. The phase is offset by half a
-# step so a grid sample is not exactly the CSV value.
-JITTER_PERIOD_STEPS = 12
 
 # Seconds to wait. None waits until stop. Return True when stop was requested.
 WaitFn = Callable[[float | None], bool]
@@ -142,8 +138,10 @@ def follow_virtual_readings(
     A restarted process continues after the last sample already stored on this
     grid.
 
-    ``jitter`` is the peak amplitude of a sine added to the held value. It is
-    only applied to float metrics. ``None`` stores the CSV value unchanged.
+    ``jitter`` is the peak noise added to the held value, so each sample stays
+    within ±jitter of the CSV value. The offset depends only on the grid step,
+    so a restart continues the same sequence. It is only applied to float
+    metrics. ``None`` stores the CSV value unchanged.
     """
     if not math.isfinite(every) or every <= 0:
         raise ValueError("every must be a positive number of seconds")
@@ -303,9 +301,17 @@ def _hold_series(
     return times, values
 
 
+def _unit_noise(step: int) -> float:
+    """Deterministic noise in [-1, 1] for one grid step."""
+    x = (step + 1) * 2246822519 & 0xFFFFFFFF
+    x ^= x >> 16
+    x = x * 3266489917 & 0xFFFFFFFF
+    x ^= x >> 16
+    return (x / 0xFFFFFFFF) * 2.0 - 1.0
+
+
 def _jittered(value: float, step: int, amplitude: float) -> float:
-    phase = 2 * math.pi * (step + 0.5) / JITTER_PERIOD_STEPS
-    return value + amplitude * math.sin(phase)
+    return value + amplitude * _unit_noise(step)
 
 
 def _held_value(times: list[float], values: list[float], ts: float) -> float:
