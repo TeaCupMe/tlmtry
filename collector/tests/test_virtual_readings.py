@@ -277,14 +277,21 @@ def test_repeat_import_skips_existing_timestamps(tmp_path: Path):
         db.close()
 
 
-def _follow_until(limit: int):
+def _paced(start: float, limit: int):
+    """Clock that jumps forward by each requested wait."""
     waits: list[float | None] = []
+    clock = {"now": start}
+
+    def now() -> float:
+        return clock["now"]
 
     def wait(seconds: float | None) -> bool:
         waits.append(seconds)
+        if seconds is not None:
+            clock["now"] += seconds
         return len(waits) >= limit
 
-    return waits, wait
+    return waits, now, wait
 
 
 def test_follow_holds_value_between_file_points(tmp_path: Path):
@@ -294,7 +301,7 @@ def test_follow_holds_value_between_file_points(tmp_path: Path):
         "1012; 30;\n1000; 21,5;\n1000; 21;\n",
         encoding="utf-8",
     )
-    waits, wait = _follow_until(5)
+    waits, now, wait = _paced(1000, 5)
     try:
         result = follow_virtual_readings(
             db,
@@ -304,10 +311,10 @@ def test_follow_holds_value_between_file_points(tmp_path: Path):
             5,
             create_virtual=True,
             wait=wait,
+            now=now,
         )
         assert result["inserted_samples"] == 5
         assert result["skipped_samples"] == 0
-        assert result["next_ts"] == 1025
         assert waits == [5, 5, 5, 5, 5]
         stored = [(row.ts, row.value_real) for row in db.iter_samples_after(0)]
         assert stored == [
@@ -325,10 +332,10 @@ def test_follow_keeps_last_value_after_the_file(tmp_path: Path):
     db = Storage(tmp_path / "primary.db")
     csv_path = tmp_path / "readings.csv"
     csv_path.write_text("1000; 5;\n1010; 9;\n", encoding="utf-8")
-    _waits, wait = _follow_until(4)
+    _waits, now, wait = _paced(1000, 4)
     try:
         follow_virtual_readings(
-            db, csv_path, 101, 0, 5, create_virtual=True, wait=wait
+            db, csv_path, 101, 0, 5, create_virtual=True, wait=wait, now=now
         )
         stored = [(row.ts, row.value_real) for row in db.iter_samples_after(0)]
         assert stored == [
@@ -341,30 +348,36 @@ def test_follow_keeps_last_value_after_the_file(tmp_path: Path):
         db.close()
 
 
-def test_follow_resumes_on_the_next_grid_step(tmp_path: Path):
+def test_follow_uses_the_value_for_the_current_time(tmp_path: Path):
     db = Storage(tmp_path / "primary.db")
     csv_path = tmp_path / "readings.csv"
-    csv_path.write_text("1000; 5;\n1030; 8;\n", encoding="utf-8")
-    _waits, wait = _follow_until(3)
+    csv_path.write_text("1000; 5;\n1030; 8;\n2000; 11;\n", encoding="utf-8")
+    waits, now, wait = _paced(1500, 2)
     try:
-        first = follow_virtual_readings(
-            db, csv_path, 101, 0, 5, create_virtual=True, wait=wait
+        result = follow_virtual_readings(
+            db, csv_path, 101, 0, 100, create_virtual=True, wait=wait, now=now
         )
-        assert first["inserted_samples"] == 3
-        again_waits, again_wait = _follow_until(1)
-        second = follow_virtual_readings(
-            db, csv_path, 101, 0, 5, create_virtual=True, wait=again_wait
-        )
-        assert second["inserted_samples"] == 1
-        assert second["skipped_samples"] == 3
-        assert again_waits == [5]
+        assert result["inserted_samples"] == 2
+        assert waits == [100, 100]
         stored = [(row.ts, row.value_real) for row in db.iter_samples_after(0)]
-        assert stored == [
-            (1000.0, 5.0),
-            (1005.0, 5.0),
-            (1010.0, 5.0),
-            (1015.0, 5.0),
-        ]
+        assert stored == [(1500.0, 8.0), (1600.0, 8.0)]
+    finally:
+        db.close()
+
+
+def test_follow_waits_until_the_schedule_starts(tmp_path: Path):
+    db = Storage(tmp_path / "primary.db")
+    csv_path = tmp_path / "readings.csv"
+    csv_path.write_text("1000; 5;\n1300; 8;\n", encoding="utf-8")
+    waits, now, wait = _paced(400, 2)
+    try:
+        result = follow_virtual_readings(
+            db, csv_path, 101, 0, 10, create_virtual=True, wait=wait, now=now
+        )
+        assert result["inserted_samples"] == 1
+        assert waits == [pytest.approx(600), 10]
+        stored = [(row.ts, row.value_real) for row in db.iter_samples_after(0)]
+        assert stored == [(1000.0, 5.0)]
     finally:
         db.close()
 
@@ -374,7 +387,7 @@ def test_follow_jitter_wobbles_around_the_held_value(tmp_path: Path):
     csv_path = tmp_path / "readings.csv"
     csv_path.write_text("1000; 10;\n1020; 14;\n", encoding="utf-8")
     amplitude = 0.2
-    _waits, wait = _follow_until(5)
+    _waits, now, wait = _paced(1000, 5)
     try:
         result = follow_virtual_readings(
             db,
@@ -385,15 +398,16 @@ def test_follow_jitter_wobbles_around_the_held_value(tmp_path: Path):
             create_virtual=True,
             wait=wait,
             jitter=amplitude,
+            now=now,
         )
         assert result["jitter"] == amplitude
         stored = [(row.ts, row.value_real) for row in db.iter_samples_after(0)]
         expected = [
-            (1000.0, _jittered(10.0, 0, amplitude)),
-            (1005.0, _jittered(10.0, 1, amplitude)),
-            (1010.0, _jittered(10.0, 2, amplitude)),
-            (1015.0, _jittered(10.0, 3, amplitude)),
-            (1020.0, _jittered(14.0, 4, amplitude)),
+            (1000.0, _jittered(10.0, 1000.0, amplitude)),
+            (1005.0, _jittered(10.0, 1005.0, amplitude)),
+            (1010.0, _jittered(10.0, 1010.0, amplitude)),
+            (1015.0, _jittered(10.0, 1015.0, amplitude)),
+            (1020.0, _jittered(14.0, 1020.0, amplitude)),
         ]
         assert [ts for ts, _value in stored] == [ts for ts, _value in expected]
         held = (10.0, 10.0, 10.0, 10.0, 14.0)
@@ -413,18 +427,35 @@ def test_follow_jitter_resumes_the_same_wave(tmp_path: Path):
     csv_path = tmp_path / "readings.csv"
     csv_path.write_text("1000; 10;\n", encoding="utf-8")
     amplitude = 0.5
-    _waits, wait = _follow_until(2)
+    _waits, now, wait = _paced(1000, 2)
     try:
         follow_virtual_readings(
-            db, csv_path, 101, 0, 5, create_virtual=True, wait=wait, jitter=amplitude
+            db,
+            csv_path,
+            101,
+            0,
+            5,
+            create_virtual=True,
+            wait=wait,
+            jitter=amplitude,
+            now=now,
         )
-        _again, again_wait = _follow_until(1)
+        _again, later, again_wait = _paced(1010, 1)
         follow_virtual_readings(
-            db, csv_path, 101, 0, 5, create_virtual=True, wait=again_wait, jitter=amplitude
+            db,
+            csv_path,
+            101,
+            0,
+            5,
+            create_virtual=True,
+            wait=again_wait,
+            jitter=amplitude,
+            now=later,
         )
-        stored = [row.value_real for row in db.iter_samples_after(0)]
-        assert stored == pytest.approx(
-            [_jittered(10.0, step, amplitude) for step in range(3)]
+        stored = [(row.ts, row.value_real) for row in db.iter_samples_after(0)]
+        assert [ts for ts, _value in stored] == [1000.0, 1005.0, 1010.0]
+        assert [value for _ts, value in stored] == pytest.approx(
+            [_jittered(10.0, ts, amplitude) for ts in (1000.0, 1005.0, 1010.0)]
         )
     finally:
         db.close()
@@ -501,6 +532,7 @@ def test_script_stops_before_loading_the_rest(tmp_path: Path):
     csv_path.write_text("1710000000; 21,5;\n1710000060; 22;\n", encoding="utf-8")
     env = os.environ.copy()
     env["PYTHONPATH"] = str(ROOT / "collector")
+    before = time.time()
     proc = subprocess.Popen(
         [
             sys.executable,
@@ -542,11 +574,12 @@ def test_script_stops_before_loading_the_rest(tmp_path: Path):
     assert seen, stderr
     body = json.loads(stdout)
     assert body["inserted_samples"] == 1
-    assert body["next_ts"] == 1710000060.0
     db = Storage(db_path)
     try:
         rows = db.iter_samples_after(0)
-        assert [(row.ts, row.value_real) for row in rows] == [(1710000000.0, 21.5)]
+        assert len(rows) == 1
+        assert rows[0].value_real == 22.0
+        assert before - 1 <= rows[0].ts <= time.time() + 1
     finally:
         db.close()
 

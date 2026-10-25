@@ -10,8 +10,8 @@ They do not mark the device online. ``last_seen`` moves only forward.
 
 ``import_virtual_readings`` writes the whole file in one transaction.
 ``follow_virtual_readings`` writes a sample every ``every`` seconds until
-stopped. CSV rows are the moments when the value changes; between them the
-previous value is held. Optional jitter adds a little noise around that value.
+stopped. The sample time is the current time, and the value is the CSV point
+in effect then. Optional jitter adds a little noise around that value.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ import bisect
 import logging
 import math
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -128,20 +129,17 @@ def follow_virtual_readings(
     stop: threading.Event | None = None,
     wait: WaitFn | None = None,
     jitter: float | None = None,
+    now: Callable[[], float] | None = None,
 ) -> dict[str, Any]:
     """Write one sample every ``every`` seconds until ``stop`` is set.
 
-    Samples start at the earliest CSV timestamp and then step by ``every``.
-    Each sample takes the value of the latest CSV point at or before its
-    timestamp. After the last file point that value is held. The first missing
-    sample is written immediately; each later sample waits ``every`` seconds.
-    A restarted process continues after the last sample already stored on this
-    grid.
+    Each sample is stamped with the current time. Its value is the latest CSV
+    point at or before that time. Before the first CSV timestamp the call
+    waits instead of writing. After the last point that value is held.
 
     ``jitter`` is the peak noise added to the held value, so each sample stays
-    within ±jitter of the CSV value. The offset depends only on the grid step,
-    so a restart continues the same sequence. It is only applied to float
-    metrics. ``None`` stores the CSV value unchanged.
+    within ±jitter of the CSV value. The offset depends on the sample time.
+    It is only applied to float metrics. ``None`` stores the CSV value unchanged.
     """
     if not math.isfinite(every) or every <= 0:
         raise ValueError("every must be a positive number of seconds")
@@ -155,6 +153,8 @@ def follow_virtual_readings(
                 stop.wait()
                 return True
             return stop.wait(seconds)
+    if now is None:
+        now = time.time
 
     path, metric, rows = _prepare(
         storage,
@@ -171,18 +171,21 @@ def follow_virtual_readings(
     if jitter is not None and metric.type != int(MetricType.FLOAT):
         raise ValueError("jitter is only supported for float metrics")
     times, values = _hold_series(rows)
-    start = times[0]
-    step = _first_missing_step(storage, address, metric_id, start, every)
     inserted = 0
     stopped = False
     while True:
         if stop.is_set():
             stopped = True
             break
-        ts = start + step * every
+        ts = now()
+        if ts < times[0]:
+            if wait(times[0] - ts):
+                stopped = True
+                break
+            continue
         held = _held_value(times, values, ts)
         if jitter is not None:
-            held = _jittered(held, step, jitter)
+            held = _jittered(held, ts, jitter)
         value_real, value_text = _encode_value(metric.type, held)
         storage.insert_reading_rows(
             address,
@@ -198,7 +201,6 @@ def follow_virtual_readings(
             ts,
             shown,
         )
-        step += 1
         if stop.is_set() or wait(every):
             stopped = True
             break
@@ -210,10 +212,9 @@ def follow_virtual_readings(
         metric,
         path,
         inserted=inserted,
-        skipped=step - inserted,
+        skipped=0,
         every=every,
         stopped=stopped or stop.is_set(),
-        next_ts=start + step * every,
         **extra,
     )
 
@@ -301,17 +302,17 @@ def _hold_series(
     return times, values
 
 
-def _unit_noise(step: int) -> float:
-    """Deterministic noise in [-1, 1] for one grid step."""
-    x = (step + 1) * 2246822519 & 0xFFFFFFFF
+def _unit_noise(key: int) -> float:
+    """Deterministic noise in [-1, 1] for one sample time."""
+    x = (key + 1) * 2246822519 & 0xFFFFFFFF
     x ^= x >> 16
     x = x * 3266489917 & 0xFFFFFFFF
     x ^= x >> 16
     return (x / 0xFFFFFFFF) * 2.0 - 1.0
 
 
-def _jittered(value: float, step: int, amplitude: float) -> float:
-    return value + amplitude * _unit_noise(step)
+def _jittered(value: float, ts: float, amplitude: float) -> float:
+    return value + amplitude * _unit_noise(int(round(ts * 1_000_000.0)))
 
 
 def _held_value(times: list[float], values: list[float], ts: float) -> float:
@@ -319,36 +320,6 @@ def _held_value(times: list[float], values: list[float], ts: float) -> float:
     if index < 0:
         index = 0
     return values[index]
-
-
-def _first_missing_step(
-    storage: Storage,
-    address: int,
-    metric_id: int,
-    start: float,
-    every: float,
-) -> int:
-    """Index of the first ``start + n * every`` sample that is not stored yet."""
-
-    def exists(step: int) -> bool:
-        ts = start + step * every
-        return bool(storage.sample_timestamps_present(address, metric_id, [ts]))
-
-    if not exists(0):
-        return 0
-    hi = 1
-    while exists(hi):
-        if hi >= 2**52:
-            return hi
-        hi *= 2
-    lo = hi // 2
-    while lo + 1 < hi:
-        mid = (lo + hi) // 2
-        if exists(mid):
-            lo = mid
-        else:
-            hi = mid
-    return hi
 
 
 def _encode_points(

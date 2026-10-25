@@ -6,8 +6,8 @@ one device address and metric. A timestamp already stored for that metric is
 skipped.
 
 ``--every SECONDS`` writes a sample at that interval and runs until SIGINT or
-SIGTERM. CSV rows set the value at those timestamps; the previous value is
-held in between. ``--jitter`` adds a little noise around that value.
+SIGTERM. The sample time is the current time, and the value is the CSV point
+in effect then. ``--jitter`` adds a little noise around that value.
 ``--once`` writes every CSV row and exits. Stdout is one JSON object.
 """
 
@@ -94,7 +94,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="SECONDS",
         help=(
             "Write a sample every SECONDS and run until stopped. "
-            "CSV rows change the held value; between them the last value is kept"
+            "The value is the CSV point in effect at the current time"
         ),
     )
     pace.add_argument(
