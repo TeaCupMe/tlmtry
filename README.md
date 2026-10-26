@@ -98,6 +98,7 @@ device.setPollIntervalMs(2000);
 | `run --sim` | То же со встроенным симулятором шины |
 | `discover` | Разовое сканирование устройств |
 | `replicate --to PATH_OR_URL` | Инкрементальная выгрузка в резервную SQLite или PostgreSQL |
+| `admin` | Локальная страница: виртуальное устройство и ручные показания |
 | `status` | Устройства и число сэмплов |
 
 Как устроен один проход и как вызвать его из внешнего скрипта: [docs/replication.md](docs/replication.md).
@@ -108,6 +109,19 @@ device.setPollIntervalMs(2000);
 python3 scripts/export_replication.py --database /tmp/tlmtry-primary.db --from-id 1 --output /tmp/tlmtry-batch.json
 python3 scripts/import_replication.py --database /tmp/tlmtry-backup.db --input /tmp/tlmtry-batch.json
 ```
+
+## Админ-панель
+
+Локальная страница записывает виртуальное устройство и показания в ту же базу, что и сборщик. Строки попадают в `samples` с `quality = 1`. Опрос шины пишет `quality = 0`, репликация переносит признак как есть. Панель не шлёт кадры в RS-485 и сама ряды не генерирует — в базу попадает только то, что ввели в форму.
+
+```bash
+tlmtry-collector admin --database /tmp/tlmtry-primary.db
+# http://127.0.0.1:8765
+```
+
+`--host` и `--port` меняют адрес (по умолчанию `127.0.0.1:8765`). Базу можно взять из YAML через `--config` вместо `--database`.
+
+Адрес виртуального устройства не должен совпадать с живым узлом на шине: следующий `DISCOVER` перезапишет манифест этого адреса.
 
 ## Тесты
 

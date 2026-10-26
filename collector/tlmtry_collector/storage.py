@@ -356,7 +356,11 @@ class Storage:
                 )
 
     def insert_samples(
-        self, address: int, samples: list[SampleValue], ts: float | None = None
+        self,
+        address: int,
+        samples: list[SampleValue],
+        ts: float | None = None,
+        quality: int = 0,
     ) -> None:
         if not samples:
             return
@@ -378,7 +382,7 @@ class Storage:
                     """
                     INSERT INTO samples(
                         address, metric_id, ts, value_real, value_text, type, quality
-                    ) VALUES (?, ?, ?, ?, ?, ?, 0)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         address,
@@ -387,6 +391,7 @@ class Storage:
                         value_real,
                         value_text,
                         int(s.type),
+                        int(quality),
                     ),
                 )
             self._execute(
@@ -397,6 +402,30 @@ class Storage:
     def sample_count(self) -> int:
         row = self._fetchone("SELECT COUNT(*) AS c FROM samples")
         return int(self._row_get(row, "c"))
+
+    def list_recent_samples(self, limit: int = 50) -> list[SampleRow]:
+        """Newest samples first. ``limit`` is clamped to 1..500."""
+        capped = min(max(int(limit), 1), 500)
+        rows = self._fetchall(
+            """
+            SELECT id, address, metric_id, ts, value_real, value_text, type, quality
+            FROM samples ORDER BY id DESC LIMIT ?
+            """,
+            (capped,),
+        )
+        return [
+            SampleRow(
+                id=int(self._row_get(r, "id")),
+                address=int(self._row_get(r, "address")),
+                metric_id=int(self._row_get(r, "metric_id")),
+                ts=float(self._row_get(r, "ts")),
+                value_real=self._row_get(r, "value_real"),
+                value_text=self._row_get(r, "value_text"),
+                type=int(self._row_get(r, "type")),
+                quality=int(self._row_get(r, "quality")),
+            )
+            for r in rows
+        ]
 
     def sample_ids_present(self, ids: list[int]) -> set[int]:
         """Return the subset of sample ids that already exist."""

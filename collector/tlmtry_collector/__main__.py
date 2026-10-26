@@ -10,6 +10,7 @@ import threading
 import time
 from pathlib import Path
 
+from .admin import serve_admin
 from .config import load_config
 from .replicate import backup_ready, replicate
 from .scheduler import CollectorScheduler, SchedulerConfig
@@ -157,6 +158,22 @@ def cmd_replicate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_admin(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config)
+    if args.port < 1 or args.port > 65535:
+        print("port must be in 1..65535", file=sys.stderr)
+        return 2
+    storage = Storage(args.database or cfg.database)
+    try:
+        serve_admin(storage, args.host, args.port)
+    except OSError as exc:
+        print(f"cannot bind {args.host}:{args.port}: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        storage.close()
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     storage = Storage(args.database or cfg.database)
@@ -210,6 +227,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Primary DB: SQLite path or postgres:// / postgresql:// URL",
     )
     rep.set_defaults(func=cmd_replicate)
+
+    adm = sub.add_parser(
+        "admin",
+        help="Local page to register a virtual device and record readings",
+    )
+    adm.add_argument(
+        "--database",
+        help="Primary DB: SQLite path or postgres:// / postgresql:// URL",
+    )
+    adm.add_argument("--host", default="127.0.0.1", help="Bind address (default 127.0.0.1)")
+    adm.add_argument("--port", type=int, default=8765, help="Bind port (default 8765)")
+    adm.set_defaults(func=cmd_admin)
 
     st = sub.add_parser("status", help="Show devices and sample counts")
     st.add_argument(
