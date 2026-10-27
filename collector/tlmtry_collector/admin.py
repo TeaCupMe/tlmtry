@@ -154,6 +154,7 @@ class AdminApp:
         parts.append("<h2>Виртуальное устройство</h2>")
         parts.append(
             "<p>Адрес 1..100. Пустые строки метрик пропускаются. "
+            "<code>metric_id</code> берётся из поля id (0..255), а не обнуляется. "
             "Не занимайте адрес живого узла: следующий DISCOVER перезапишет манифест.</p>"
         )
         parts.append('<form method="post" action="/devices" accept-charset="utf-8">')
@@ -162,11 +163,13 @@ class AdminApp:
             '<label>Имя <input name="name" required maxlength="64"></label>'
         )
         parts.append(
-            '<div class="metric-head"><span>Имя метрики</span><span>Тип</span><span>Единица</span></div>'
+            '<div class="metric-head"><span>id</span><span>Имя метрики</span>'
+            "<span>Тип</span><span>Единица</span></div>"
         )
-        for _ in range(METRIC_SLOTS):
+        for slot in range(METRIC_SLOTS):
             parts.append(
                 '<div class="metric-row">'
+                f'<input name="metric_id" inputmode="numeric" value="{slot}">'
                 '<input name="metric_name" maxlength="64">'
                 '<select name="metric_type">'
                 '<option value="f32" selected>f32</option>'
@@ -199,7 +202,7 @@ class AdminApp:
                 unit = f", {_esc(metric.unit)}" if metric.unit else ""
                 parts.append(
                     "<label>"
-                    f"{_esc(metric.name)} ({_esc(label)}{unit}) "
+                    f"{_esc(metric.name)} (id {_esc(metric.metric_id)}, {_esc(label)}{unit}) "
                     f'<input name="value_{metric.metric_id}" required>'
                     "</label>"
                 )
@@ -216,17 +219,18 @@ class AdminApp:
         else:
             parts.append(
                 "<table><thead><tr>"
-                "<th>id</th><th>Адрес</th><th>Метрика</th><th>Значение</th>"
+                "<th>id</th><th>Адрес</th><th>metric_id</th><th>Метрика</th><th>Значение</th>"
                 "<th>Время</th><th>Источник</th>"
                 "</tr></thead><tbody>"
             )
             for sample in samples:
                 metric = names.get((sample.address, sample.metric_id))
-                metric_label = metric.name if metric else str(sample.metric_id)
+                metric_label = metric.name if metric else "—"
                 parts.append(
                     "<tr>"
                     f"<td>{sample.id}</td>"
                     f"<td>{sample.address}</td>"
+                    f"<td>{sample.metric_id}</td>"
                     f"<td>{_esc(metric_label)}</td>"
                     f"<td>{_esc(_format_value(sample))}</td>"
                     f"<td>{_esc(_format_ts(sample.ts))}</td>"
@@ -369,13 +373,20 @@ def _parse_metric_slots(form: dict[str, list[str]]) -> list[MetricInfo]:
     names = form.get("metric_name", [])
     types = form.get("metric_type", [])
     units = form.get("metric_unit", [])
+    ids = form.get("metric_id", [])
     metrics: list[MetricInfo] = []
-    count = max(len(names), len(types), len(units))
+    seen: set[int] = set()
+    count = max(len(names), len(types), len(units), len(ids))
     for index in range(count):
         name_raw = names[index] if index < len(names) else ""
         if name_raw.strip() == "":
             continue
         name = _clean_text(name_raw, NAME_LIMIT, "имя метрики", allow_empty=False)
+        id_raw = ids[index] if index < len(ids) else ""
+        metric_id = _parse_metric_id(id_raw, fallback=index)
+        if metric_id in seen:
+            raise FormError(f"metric_id {metric_id} повторяется")
+        seen.add(metric_id)
         type_raw = (types[index] if index < len(types) else "").strip()
         kind = _TYPE_BY_LABEL.get(type_raw)
         if kind is None:
@@ -387,9 +398,22 @@ def _parse_metric_slots(form: dict[str, list[str]]) -> list[MetricInfo]:
             allow_empty=True,
         )
         metrics.append(
-            MetricInfo(metric_id=len(metrics), type=kind, unit=unit, name=name)
+            MetricInfo(metric_id=metric_id, type=kind, unit=unit, name=name)
         )
     return metrics
+
+
+def _parse_metric_id(raw: str, *, fallback: int) -> int:
+    text = raw.strip()
+    if not text:
+        value = fallback
+    elif not text.isdigit():
+        raise FormError("metric_id: нужно целое от 0 до 255")
+    else:
+        value = int(text)
+    if not 0 <= value <= 255:
+        raise FormError("metric_id: нужно целое от 0 до 255")
+    return value
 
 
 def _metric_kind(metric: MetricCatalogRow) -> MetricType:
@@ -483,7 +507,7 @@ def _source_label(quality: int) -> str:
 def _device_row(device: DeviceRow, metrics: list[MetricCatalogRow]) -> str:
     seen = _format_ts(device.last_seen) if device.last_seen else "—"
     metric_text = ", ".join(
-        f"{m.name} ({_LABEL_BY_TYPE.get(m.type, m.type)}"
+        f"{m.name} #{m.metric_id} ({_LABEL_BY_TYPE.get(m.type, m.type)}"
         + (f", {m.unit}" if m.unit else "")
         + ")"
         for m in metrics
@@ -517,7 +541,7 @@ form { margin: 0 0 1.4rem; padding: 0.8rem 0; border-top: 1px solid #eee; }
 label { display: block; margin: 0.45rem 0; }
 input, select, button { font: inherit; padding: 0.25rem 0.4rem; }
 button { margin-top: 0.6rem; }
-.metric-head, .metric-row { display: grid; grid-template-columns: 1fr 8rem 8rem; gap: 0.4rem; margin: 0.25rem 0; }
+.metric-head, .metric-row { display: grid; grid-template-columns: 4.5rem 1fr 8rem 8rem; gap: 0.4rem; margin: 0.25rem 0; }
 .ok { background: #e7f6e7; padding: 0.5rem 0.7rem; }
 .error { background: #fde8e8; padding: 0.5rem 0.7rem; }
 """

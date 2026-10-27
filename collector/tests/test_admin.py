@@ -120,3 +120,81 @@ def test_admin_records_virtual_readings_and_rejects_bad_values(tmp_path: Path):
         server.server_close()
         thread.join(timeout=2)
         storage.close()
+
+
+def test_metric_id_comes_from_the_form_not_always_zero(tmp_path: Path):
+    storage = Storage(tmp_path / "ids.db")
+    server = make_server(storage, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address[:2]
+    base = f"http://{host}:{port}"
+    try:
+        status, page = _post(
+            base,
+            "/devices",
+            [
+                ("address", "3"),
+                ("name", "probe"),
+                ("metric_id", "0"),
+                ("metric_name", ""),
+                ("metric_type", "f32"),
+                ("metric_unit", ""),
+                ("metric_id", "5"),
+                ("metric_name", "temp_c"),
+                ("metric_type", "f32"),
+                ("metric_unit", "C"),
+                ("metric_id", "9"),
+                ("metric_name", "alarm"),
+                ("metric_type", "bool"),
+                ("metric_unit", ""),
+            ],
+        )
+        assert status == 200
+        assert 'name="value_5"' in page
+        assert 'name="value_9"' in page
+        assert "temp_c #5" in page
+        assert "alarm #9" in page
+
+        status, page = _post(
+            base,
+            "/readings",
+            [
+                ("address", "3"),
+                ("value_5", "21.5"),
+                ("value_9", "0"),
+            ],
+        )
+        assert status == 200
+        assert ">5<" in page
+        assert ">9<" in page
+        rows = {row.metric_id: row for row in storage.list_recent_samples()}
+        assert set(rows) == {5, 9}
+        assert rows[5].value_real == 21.5
+        assert rows[9].value_text == "false"
+        assert rows[5].quality == 1
+
+        status, page = _post(
+            base,
+            "/devices",
+            [
+                ("address", "4"),
+                ("name", "dup"),
+                ("metric_id", "2"),
+                ("metric_name", "a"),
+                ("metric_type", "i32"),
+                ("metric_unit", ""),
+                ("metric_id", "2"),
+                ("metric_name", "b"),
+                ("metric_type", "i32"),
+                ("metric_unit", ""),
+            ],
+        )
+        assert status == 400
+        assert "повторяется" in page
+        assert all(row.address != 4 for row in storage.list_devices())
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        storage.close()
