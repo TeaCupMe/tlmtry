@@ -1,12 +1,15 @@
-"""Local admin page for registering a virtual device and recording readings.
+"""Local admin page for virtual devices, manual readings, and schedules.
 
 Virtual samples are stored in the same tables as bus polls, with quality = 1.
-The page does not talk to the RS-485 bus and does not generate series itself.
+A schedule writes samples on its own while this process is running: linear
+transition between keyframes, then uniform noise of the given amplitude.
+The page does not talk to the RS-485 bus.
 """
 
 from __future__ import annotations
 
 import html
+import logging
 import math
 import threading
 import time
@@ -14,13 +17,19 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlparse
 
 from .protocol import DeviceManifest, MetricInfo, MetricType, SampleValue
+from .schedule import Keyframe, VirtualSchedule, emit_due, interpolate
 from .storage import DeviceRow, MetricCatalogRow, SampleRow, Storage
+
+log = logging.getLogger(__name__)
 
 VIRTUAL_QUALITY = 1
 METRIC_SLOTS = 8
+KEYFRAME_SLOTS = 8
 MAX_BODY_BYTES = 65_536
 NAME_LIMIT = 64
 UNIT_LIMIT = 16
+SCHEDULE_POLL_S = 0.5
+_NUMERIC_TYPES = {MetricType.INT32, MetricType.FLOAT, MetricType.UINT16}
 
 _TYPE_BY_LABEL = {
     "i32": MetricType.INT32,
@@ -102,6 +111,36 @@ class AdminApp:
             address, samples, ts=stamp, quality=VIRTUAL_QUALITY
         )
 
+    def save_schedule(self, form: dict[str, list[str]]) -> None:
+        address = _parse_address(_first(form, "address"))
+        metric = _require_numeric_metric(self.storage, address, _first(form, "metric_id"))
+        step_s = _parse_step(_first(form, "step_s"))
+        noise = _parse_noise(_first(form, "noise"))
+        keyframes = _parse_keyframes(form)
+        self.storage.replace_schedule(
+            VirtualSchedule(
+                address=address,
+                metric_id=metric.metric_id,
+                step_s=step_s,
+                noise=noise,
+                enabled=True,
+                last_emit_ts=None,
+                keyframes=keyframes,
+            )
+        )
+
+    def stop_schedule(self, form: dict[str, list[str]]) -> None:
+        address = _parse_address(_first(form, "address"))
+        metric_id = _parse_metric_id(_first(form, "metric_id"), fallback=-1)
+        self.storage.delete_schedule(address, metric_id)
+
+    def emit_due(self, now: float | None = None) -> int:
+        return emit_due(
+            self.storage,
+            now=time.time() if now is None else now,
+            quality=VIRTUAL_QUALITY,
+        )
+
     def render(self, *, notice: str = "", error: str = "") -> str:
         devices = self.storage.list_devices()
         metrics = self.storage.list_metrics()
@@ -128,7 +167,8 @@ class AdminApp:
             "<h1>Виртуальные показания</h1>",
             "<p class=\"lede\">Запись идёт в ту же базу, что и у сборщика, "
             "с <code>quality = 1</code>. Опрос шины пишет <code>quality = 0</code>. "
-            "Страница не обращается к RS-485 и сама ряды не генерирует.</p>",
+            "Расписание само дописывает показания, пока этот процесс запущен: "
+            "между точками значение меняется линейно, затем добавляется шум ±.</p>",
             f"<p>База: <code>{_esc(self.storage.location)}</code> "
             f"({_esc(self.storage.backend)})</p>",
         ]
@@ -213,6 +253,15 @@ class AdminApp:
                 "</form>"
             )
 
+        parts.extend(
+            _schedule_sections(
+                devices,
+                by_address,
+                self.storage.list_schedules(),
+                names,
+            )
+        )
+
         parts.append("<h2>Последние показания</h2>")
         if not samples:
             parts.append("<p>Показаний ещё нет.</p>")
@@ -245,11 +294,26 @@ class AdminApp:
 
 def make_server(storage: Storage, host: str, port: int) -> ThreadingHTTPServer:
     app = AdminApp(storage)
-    return ThreadingHTTPServer((host, port), _handler_class(app))
+    server = ThreadingHTTPServer((host, port), _handler_class(app))
+    server.admin_app = app  # type: ignore[attr-defined]
+    return server
 
 
 def serve_admin(storage: Storage, host: str, port: int) -> None:
     server = make_server(storage, host, port)
+    app: AdminApp = server.admin_app  # type: ignore[attr-defined]
+    stop = threading.Event()
+
+    def _loop() -> None:
+        while not stop.wait(SCHEDULE_POLL_S):
+            try:
+                with app.lock:
+                    app.emit_due()
+            except Exception:
+                log.exception("virtual schedule tick failed")
+
+    worker = threading.Thread(target=_loop, name="virtual-schedule", daemon=True)
+    worker.start()
     bound_host, bound_port = server.server_address[:2]
     print(
         f"admin: http://{bound_host}:{bound_port}  database: {storage.location}",
@@ -260,6 +324,8 @@ def serve_admin(storage: Storage, host: str, port: int) -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        stop.set()
+        worker.join(timeout=2)
         server.server_close()
 
 
@@ -292,6 +358,14 @@ def _handler_class(app: AdminApp) -> type[BaseHTTPRequestHandler]:
                     if parsed.path == "/readings":
                         app.save_readings(form)
                         self._redirect("/?ok=" + quote("Показание записано"))
+                        return
+                    if parsed.path == "/schedules":
+                        app.save_schedule(form)
+                        self._redirect("/?ok=" + quote("Расписание записано"))
+                        return
+                    if parsed.path == "/schedules/stop":
+                        app.stop_schedule(form)
+                        self._redirect("/?ok=" + quote("Расписание остановлено"))
                         return
                 self._send(404, "not found\n", "text/plain; charset=utf-8")
             except FormError as exc:
@@ -477,6 +551,171 @@ def _parse_timestamp(raw: str) -> float | None:
     return stamp
 
 
+def _require_numeric_metric(storage: Storage, address: int, raw_id: str) -> MetricCatalogRow:
+    metric_id = _parse_metric_id(raw_id, fallback=-1)
+    devices = {d.address for d in storage.list_devices()}
+    if address not in devices:
+        raise FormError("устройство с таким адресом не зарегистрировано")
+    for metric in storage.list_metrics():
+        if metric.address == address and metric.metric_id == metric_id:
+            try:
+                kind = MetricType(metric.type)
+            except ValueError as exc:
+                raise FormError("метрика: неизвестный тип") from exc
+            if kind not in _NUMERIC_TYPES:
+                raise FormError("расписание доступно для числовых метрик")
+            return metric
+    raise FormError("метрика с таким id не зарегистрирована")
+
+
+def _parse_step(raw: str) -> float:
+    text = raw.strip().replace(",", ".")
+    try:
+        step = float(text)
+    except ValueError as exc:
+        raise FormError("шаг: нужно число секунд больше 0") from exc
+    if not math.isfinite(step) or step <= 0:
+        raise FormError("шаг: нужно число секунд больше 0")
+    if step > 86400 * 30:
+        raise FormError("шаг: не больше 30 суток")
+    return step
+
+
+def _parse_noise(raw: str) -> float:
+    text = raw.strip().replace(",", ".")
+    if not text:
+        return 0.0
+    try:
+        noise = float(text)
+    except ValueError as exc:
+        raise FormError("шум: нужно неотрицательное число") from exc
+    if not math.isfinite(noise) or noise < 0:
+        raise FormError("шум: нужно неотрицательное число")
+    return noise
+
+
+def _parse_keyframes(form: dict[str, list[str]]) -> list[Keyframe]:
+    stamps = form.get("kf_ts", [])
+    values = form.get("kf_value", [])
+    count = max(len(stamps), len(values))
+    points: list[Keyframe] = []
+    seen: set[float] = set()
+    for index in range(count):
+        ts_raw = stamps[index] if index < len(stamps) else ""
+        value_raw = values[index] if index < len(values) else ""
+        if ts_raw.strip() == "" and value_raw.strip() == "":
+            continue
+        if ts_raw.strip() == "" or value_raw.strip() == "":
+            raise FormError("точка расписания: нужны и время, и значение")
+        stamp = _parse_timestamp(ts_raw)
+        if stamp is None:
+            raise FormError("точка расписания: нужно время")
+        text = value_raw.strip().replace(",", ".")
+        try:
+            value = float(text)
+        except ValueError as exc:
+            raise FormError("точка расписания: значение должно быть числом") from exc
+        if not math.isfinite(value):
+            raise FormError("точка расписания: значение должно быть конечным числом")
+        if stamp in seen:
+            raise FormError("точки расписания: одинаковое время")
+        seen.add(stamp)
+        points.append(Keyframe(ts=stamp, value=value))
+    if not points:
+        raise FormError("нужна хотя бы одна точка расписания")
+    points.sort(key=lambda item: item.ts)
+    return points
+
+
+def _schedule_sections(
+    devices: list[DeviceRow],
+    by_address: dict[int, list[MetricCatalogRow]],
+    schedules: list[VirtualSchedule],
+    names: dict[tuple[int, int], MetricCatalogRow],
+) -> list[str]:
+    parts = ["<h2>Расписание</h2>"]
+    parts.append(
+        "<p>Пока панель запущена, показание пишется с заданным шагом. "
+        "Между точками значение переходит линейно. До первой и после последней "
+        "точки оно держится. Шум — случайная добавка в пределах ± на каждое показание. "
+        "Время — локальное время машины, где запущена панель.</p>"
+    )
+    if schedules:
+        parts.append(
+            "<table><thead><tr>"
+            "<th>Адрес</th><th>Метрика</th><th>Шаг, с</th><th>Шум ±</th>"
+            "<th>Сейчас без шума</th><th>Точки</th><th></th>"
+            "</tr></thead><tbody>"
+        )
+        now = time.time()
+        for schedule in schedules:
+            metric = names.get((schedule.address, schedule.metric_id))
+            label = metric.name if metric else str(schedule.metric_id)
+            current = ""
+            if schedule.keyframes:
+                current = f"{interpolate(schedule.keyframes, now):.6g}"
+            point_text = ", ".join(
+                f"{_format_ts(point.ts)}→{point.value:.6g}" for point in schedule.keyframes
+            )
+            parts.append(
+                "<tr>"
+                f"<td>{schedule.address}</td>"
+                f"<td>{_esc(label)} #{schedule.metric_id}</td>"
+                f"<td>{_esc(f'{schedule.step_s:.6g}')}</td>"
+                f"<td>{_esc(f'{schedule.noise:.6g}')}</td>"
+                f"<td>{_esc(current)}</td>"
+                f"<td>{_esc(point_text)}</td>"
+                "<td>"
+                '<form class="inline" method="post" action="/schedules/stop" accept-charset="utf-8">'
+                f'<input type="hidden" name="address" value="{schedule.address}">'
+                f'<input type="hidden" name="metric_id" value="{schedule.metric_id}">'
+                '<button type="submit">Остановить</button>'
+                "</form></td>"
+                "</tr>"
+            )
+        parts.append("</tbody></table>")
+    else:
+        parts.append("<p>Активных расписаний нет.</p>")
+
+    numeric_found = False
+    for device in devices:
+        for metric in by_address.get(device.address, []):
+            try:
+                kind = MetricType(metric.type)
+            except ValueError:
+                continue
+            if kind not in _NUMERIC_TYPES:
+                continue
+            numeric_found = True
+            label = _LABEL_BY_TYPE.get(metric.type, str(metric.type))
+            unit = f", {_esc(metric.unit)}" if metric.unit else ""
+            parts.append('<form method="post" action="/schedules" accept-charset="utf-8">')
+            parts.append(
+                f"<h3>{_esc(device.address)} · {_esc(device.name)} · "
+                f"{_esc(metric.name)} (id {_esc(metric.metric_id)}, {_esc(label)}{unit})</h3>"
+                f'<input type="hidden" name="address" value="{device.address}">'
+                f'<input type="hidden" name="metric_id" value="{metric.metric_id}">'
+            )
+            parts.append(
+                '<label>Шаг, секунды <input name="step_s" required inputmode="decimal"></label>'
+                '<label>Шум ± <input name="noise" value="0" inputmode="decimal"></label>'
+            )
+            parts.append('<div class="kf-head"><span>Время</span><span>Значение</span></div>')
+            for _ in range(KEYFRAME_SLOTS):
+                parts.append(
+                    '<div class="kf-row">'
+                    '<input type="datetime-local" name="kf_ts" step="1">'
+                    '<input name="kf_value" inputmode="decimal">'
+                    "</div>"
+                )
+            parts.append('<button type="submit">Записать расписание</button></form>')
+    if devices and not numeric_found:
+        parts.append("<p>Числовых метрик нет — расписание не к чему привязать.</p>")
+    elif not devices:
+        parts.append("<p>Сначала запишите устройство.</p>")
+    return parts
+
+
 def _format_value(sample: SampleRow) -> str:
     if sample.value_text:
         return sample.value_text
@@ -538,10 +777,13 @@ code { font-family: ui-monospace, monospace; }
 table { border-collapse: collapse; width: 100%; margin: 0.5rem 0 1.5rem; }
 th, td { border-bottom: 1px solid #ddd; text-align: left; padding: 0.35rem 0.45rem; vertical-align: top; }
 form { margin: 0 0 1.4rem; padding: 0.8rem 0; border-top: 1px solid #eee; }
+form.inline { border: 0; margin: 0; padding: 0; }
+form.inline button { margin-top: 0; }
 label { display: block; margin: 0.45rem 0; }
 input, select, button { font: inherit; padding: 0.25rem 0.4rem; }
 button { margin-top: 0.6rem; }
 .metric-head, .metric-row { display: grid; grid-template-columns: 4.5rem 1fr 8rem 8rem; gap: 0.4rem; margin: 0.25rem 0; }
+.kf-head, .kf-row { display: grid; grid-template-columns: 1fr 10rem; gap: 0.4rem; margin: 0.25rem 0; }
 .ok { background: #e7f6e7; padding: 0.5rem 0.7rem; }
 .error { background: #fde8e8; padding: 0.5rem 0.7rem; }
 """

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import signal
 import sys
 import threading
@@ -158,12 +159,22 @@ def cmd_replicate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _admin_database(args: argparse.Namespace, cfg) -> str:
+    if args.database:
+        return args.database
+    env = os.environ.get("TLMTRY_DATABASE", "").strip()
+    if env:
+        return env
+    return cfg.database
+
+
 def cmd_admin(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
+    _setup_logging(cfg.log_level)
     if args.port < 1 or args.port > 65535:
         print("port must be in 1..65535", file=sys.stderr)
         return 2
-    storage = Storage(args.database or cfg.database)
+    storage = Storage(_admin_database(args, cfg))
     try:
         serve_admin(storage, args.host, args.port)
     except OSError as exc:
@@ -234,7 +245,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     adm.add_argument(
         "--database",
-        help="Primary DB: SQLite path or postgres:// / postgresql:// URL",
+        help="Primary DB. Overrides TLMTRY_DATABASE and the YAML database field",
     )
     adm.add_argument("--host", default="127.0.0.1", help="Bind address (default 127.0.0.1)")
     adm.add_argument("--port", type=int, default=8765, help="Bind port (default 8765)")

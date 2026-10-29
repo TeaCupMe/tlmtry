@@ -15,6 +15,7 @@ from typing import Any, Iterator, Literal
 from urllib.parse import urlparse, urlunparse
 
 from .protocol import DeviceManifest, MetricType, SampleValue
+from .schedule import Keyframe, VirtualSchedule
 
 Backend = Literal["sqlite", "postgres"]
 
@@ -61,6 +62,24 @@ CREATE TABLE IF NOT EXISTS replication_state (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS virtual_schedules (
+    address INTEGER NOT NULL,
+    metric_id INTEGER NOT NULL,
+    step_s REAL NOT NULL,
+    noise REAL NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    last_emit_ts REAL,
+    PRIMARY KEY (address, metric_id)
+);
+
+CREATE TABLE IF NOT EXISTS virtual_keyframes (
+    address INTEGER NOT NULL,
+    metric_id INTEGER NOT NULL,
+    ts REAL NOT NULL,
+    value REAL NOT NULL,
+    PRIMARY KEY (address, metric_id, ts)
+);
 """
 
 # Alias kept for replicate.py / callers that apply schema to a SQLite backup.
@@ -105,6 +124,24 @@ CREATE INDEX IF NOT EXISTS idx_samples_addr_ts ON samples(address, ts);
 CREATE TABLE IF NOT EXISTS replication_state (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS virtual_schedules (
+    address INTEGER NOT NULL,
+    metric_id INTEGER NOT NULL,
+    step_s DOUBLE PRECISION NOT NULL,
+    noise DOUBLE PRECISION NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    last_emit_ts DOUBLE PRECISION,
+    PRIMARY KEY (address, metric_id)
+);
+
+CREATE TABLE IF NOT EXISTS virtual_keyframes (
+    address INTEGER NOT NULL,
+    metric_id INTEGER NOT NULL,
+    ts DOUBLE PRECISION NOT NULL,
+    value DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (address, metric_id, ts)
 );
 """
 
@@ -578,6 +615,106 @@ class Storage:
                 """,
                 ("last_replicate_ts", str(stamp)),
             )
+
+    def replace_schedule(self, schedule: VirtualSchedule) -> None:
+        points = sorted(schedule.keyframes, key=lambda item: item.ts)
+        with self.transaction():
+            self._execute(
+                """
+                INSERT INTO virtual_schedules(
+                    address, metric_id, step_s, noise, enabled, last_emit_ts
+                ) VALUES (?, ?, ?, ?, 1, NULL)
+                ON CONFLICT(address, metric_id) DO UPDATE SET
+                    step_s=excluded.step_s,
+                    noise=excluded.noise,
+                    enabled=1,
+                    last_emit_ts=NULL
+                """,
+                (
+                    schedule.address,
+                    schedule.metric_id,
+                    float(schedule.step_s),
+                    float(schedule.noise),
+                ),
+            )
+            self._execute(
+                "DELETE FROM virtual_keyframes WHERE address = ? AND metric_id = ?",
+                (schedule.address, schedule.metric_id),
+            )
+            for point in points:
+                self._execute(
+                    """
+                    INSERT INTO virtual_keyframes(address, metric_id, ts, value)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (schedule.address, schedule.metric_id, point.ts, point.value),
+                )
+
+    def delete_schedule(self, address: int, metric_id: int) -> None:
+        with self.transaction():
+            self._execute(
+                "DELETE FROM virtual_keyframes WHERE address = ? AND metric_id = ?",
+                (address, metric_id),
+            )
+            self._execute(
+                "DELETE FROM virtual_schedules WHERE address = ? AND metric_id = ?",
+                (address, metric_id),
+            )
+
+    def mark_schedule_emitted(self, address: int, metric_id: int, ts: float) -> None:
+        with self.transaction():
+            self._execute(
+                """
+                UPDATE virtual_schedules SET last_emit_ts = ?
+                WHERE address = ? AND metric_id = ?
+                """,
+                (ts, address, metric_id),
+            )
+
+    def list_schedules(self) -> list[VirtualSchedule]:
+        rows = self._fetchall(
+            """
+            SELECT address, metric_id, step_s, noise, enabled, last_emit_ts
+            FROM virtual_schedules
+            ORDER BY address, metric_id
+            """
+        )
+        points = self._fetchall(
+            """
+            SELECT address, metric_id, ts, value
+            FROM virtual_keyframes
+            ORDER BY ts
+            """
+        )
+        grouped: dict[tuple[int, int], list[Keyframe]] = {}
+        for point in points:
+            key = (
+                int(self._row_get(point, "address")),
+                int(self._row_get(point, "metric_id")),
+            )
+            grouped.setdefault(key, []).append(
+                Keyframe(
+                    ts=float(self._row_get(point, "ts")),
+                    value=float(self._row_get(point, "value")),
+                )
+            )
+        schedules: list[VirtualSchedule] = []
+        for row in rows:
+            address = int(self._row_get(row, "address"))
+            metric_id = int(self._row_get(row, "metric_id"))
+            last = self._row_get(row, "last_emit_ts")
+            schedules.append(
+                VirtualSchedule(
+                    address=address,
+                    metric_id=metric_id,
+                    step_s=float(self._row_get(row, "step_s")),
+                    noise=float(self._row_get(row, "noise")),
+                    enabled=bool(self._row_get(row, "enabled")),
+                    last_emit_ts=None if last is None else float(last),
+                    keyframes=grouped.get((address, metric_id), []),
+                )
+            )
+        return schedules
 
     def connection(self) -> Any:
         """Return the raw DB-API connection (sqlite3 or psycopg)."""
