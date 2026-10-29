@@ -30,6 +30,7 @@ NAME_LIMIT = 64
 UNIT_LIMIT = 16
 SCHEDULE_POLL_S = 0.5
 _NUMERIC_TYPES = {MetricType.INT32, MetricType.FLOAT, MetricType.UINT16}
+_VIEWS = ("sensors", "readings", "schedules")
 
 _TYPE_BY_LABEL = {
     "i32": MetricType.INT32,
@@ -141,7 +142,7 @@ class AdminApp:
             quality=VIRTUAL_QUALITY,
         )
 
-    def render(self, *, notice: str = "", error: str = "") -> str:
+    def render(self, *, notice: str = "", error: str = "", view: str = "sensors") -> str:
         devices = self.storage.list_devices()
         metrics = self.storage.list_metrics()
         samples = self.storage.list_recent_samples(limit=30)
@@ -151,6 +152,9 @@ class AdminApp:
         for rows in by_address.values():
             rows.sort(key=lambda m: m.metric_id)
         names = {(m.address, m.metric_id): m for m in metrics}
+        schedules = self.storage.list_schedules()
+        if view not in _VIEWS:
+            view = "sensors"
 
         parts = [
             "<!DOCTYPE html>",
@@ -163,44 +167,62 @@ class AdminApp:
             _CSS,
             "</style>",
             "</head>",
-            "<body>",
-            "<h1>Виртуальные показания</h1>",
-            "<p class=\"lede\">Запись идёт в ту же базу, что и у сборщика, "
-            "с <code>quality = 1</code>. Опрос шины пишет <code>quality = 0</code>. "
-            "Расписание само дописывает показания, пока этот процесс запущен: "
-            "между точками значение меняется линейно, затем добавляется шум ±.</p>",
-            f"<p>База: <code>{_esc(self.storage.location)}</code> "
-            f"({_esc(self.storage.backend)})</p>",
+            f'<body class="view-{view}">',
+            '<div class="app">',
+            "<aside class=\"side\">",
+            '<div class="brand"><span class="mark">T</span><div><strong>tlmtry</strong>'
+            "<span>админ-панель</span></div></div>",
+            "<nav>",
+            _nav_link("sensors", view, "Добавление виртуальных датчиков"),
+            _nav_link("readings", view, "Добавление разовых показаний"),
+            _nav_link(
+                "schedules",
+                view,
+                "Добавление расписаний",
+                count=len(schedules),
+            ),
+            "</nav>",
+            '<p class="side-db">База '
+            f"<code>{_esc(self.storage.location)}</code> "
+            f"<span>{_esc(self.storage.backend)}</span></p>",
+            "</aside>",
+            "<main>",
         ]
         if notice:
-            parts.append(f'<p class="ok">{_esc(notice)}</p>')
+            parts.append(f'<p class="banner ok" role="status">{_esc(notice)}</p>')
         if error:
-            parts.append(f'<p class="error">{_esc(error)}</p>')
+            parts.append(f'<p class="banner error" role="alert">{_esc(error)}</p>')
 
-        parts.append("<h2>Устройства</h2>")
+        parts.append('<section class="panel panel-sensors">')
+        parts.append(
+            '<header class="panel-head"><h1>Виртуальные датчики</h1>'
+            '<p class="hint">Адрес 1..100. Пустые строки метрик пропускаются. '
+            "Поле id — это <code>metric_id</code> (0..255). "
+            "Не занимайте адрес живого узла: следующий DISCOVER перезапишет манифест.</p>"
+            "</header>"
+        )
+        parts.append('<section class="card" id="devices"><h2>Уже в базе</h2>')
         if not devices:
-            parts.append("<p>Пока нет ни одного устройства.</p>")
+            parts.append('<p class="empty">Пока нет ни одного устройства.</p>')
         else:
             parts.append(
-                "<table><thead><tr>"
+                '<div class="table-wrap"><table><thead><tr>'
                 "<th>Адрес</th><th>Имя</th><th>Прошивка</th><th>Интервал, мс</th>"
                 "<th>На связи</th><th>Последний раз</th><th>Метрики</th>"
                 "</tr></thead><tbody>"
             )
             for device in devices:
                 parts.append(_device_row(device, by_address.get(device.address, [])))
-            parts.append("</tbody></table>")
+            parts.append("</tbody></table></div>")
+        parts.append("</section>")
 
-        parts.append("<h2>Виртуальное устройство</h2>")
-        parts.append(
-            "<p>Адрес 1..100. Пустые строки метрик пропускаются. "
-            "<code>metric_id</code> берётся из поля id (0..255), а не обнуляется. "
-            "Не занимайте адрес живого узла: следующий DISCOVER перезапишет манифест.</p>"
-        )
+        parts.append('<section class="card" id="device-form"><h2>Новый датчик</h2>')
         parts.append('<form method="post" action="/devices" accept-charset="utf-8">')
         parts.append(
+            '<div class="pair">'
             '<label>Адрес <input name="address" required inputmode="numeric"></label>'
             '<label>Имя <input name="name" required maxlength="64"></label>'
+            "</div>"
         )
         parts.append(
             '<div class="metric-head"><span>id</span><span>Имя метрики</span>'
@@ -220,11 +242,18 @@ class AdminApp:
                 '<input name="metric_unit" maxlength="16">'
                 "</div>"
             )
-        parts.append('<button type="submit">Записать устройство</button></form>')
+        parts.append('<button class="primary" type="submit">Записать устройство</button></form>')
+        parts.append("</section></section>")
 
-        parts.append("<h2>Доложить показание</h2>")
+        parts.append('<section class="panel panel-readings">')
+        parts.append(
+            '<header class="panel-head"><h1>Разовые показания</h1>'
+            '<p class="hint">Строка пишется в ту же базу, что и опрос шины, '
+            "с <code>quality = 1</code>. Пустое время значит «сейчас».</p></header>"
+        )
+        parts.append('<section class="card" id="readings"><h2>Доложить показание</h2>')
         if not devices:
-            parts.append("<p>Сначала запишите устройство.</p>")
+            parts.append('<p class="empty">Сначала запишите устройство.</p>')
         for device in devices:
             device_metrics = by_address.get(device.address, [])
             if not device_metrics:
@@ -249,25 +278,16 @@ class AdminApp:
             parts.append(
                 '<label>Время (пусто — сейчас) '
                 '<input type="datetime-local" name="ts" step="1"></label>'
-                '<button type="submit">Записать показание</button>'
+                '<button class="primary" type="submit">Записать показание</button>'
                 "</form>"
             )
-
-        parts.extend(
-            _schedule_sections(
-                devices,
-                by_address,
-                self.storage.list_schedules(),
-                names,
-            )
-        )
-
-        parts.append("<h2>Последние показания</h2>")
+        parts.append("</section>")
+        parts.append('<section class="card" id="samples"><h2>Последние показания</h2>')
         if not samples:
-            parts.append("<p>Показаний ещё нет.</p>")
+            parts.append('<p class="empty">Показаний ещё нет.</p>')
         else:
             parts.append(
-                "<table><thead><tr>"
+                '<div class="table-wrap"><table><thead><tr>'
                 "<th>id</th><th>Адрес</th><th>metric_id</th><th>Метрика</th><th>Значение</th>"
                 "<th>Время</th><th>Источник</th>"
                 "</tr></thead><tbody>"
@@ -275,20 +295,31 @@ class AdminApp:
             for sample in samples:
                 metric = names.get((sample.address, sample.metric_id))
                 metric_label = metric.name if metric else "—"
+                source = _source_label(sample.quality)
+                source_class = "virtual" if sample.quality == VIRTUAL_QUALITY else "bus"
                 parts.append(
                     "<tr>"
                     f"<td>{sample.id}</td>"
                     f"<td>{sample.address}</td>"
                     f"<td>{sample.metric_id}</td>"
                     f"<td>{_esc(metric_label)}</td>"
-                    f"<td>{_esc(_format_value(sample))}</td>"
+                    f"<td class=\"num\">{_esc(_format_value(sample))}</td>"
                     f"<td>{_esc(_format_ts(sample.ts))}</td>"
-                    f"<td>{_esc(_source_label(sample.quality))}</td>"
+                    f"<td><span class=\"pill {source_class}\">{_esc(source)}</span></td>"
                     "</tr>"
                 )
-            parts.append("</tbody></table>")
-
-        parts.append("</body></html>")
+            parts.append("</tbody></table></div>")
+        parts.append("</section></section>")
+        parts.append('<section class="panel panel-schedules">')
+        parts.append(
+            '<header class="panel-head"><h1>Расписания</h1>'
+            '<p class="hint">Пока панель запущена, показание пишется с заданным шагом. '
+            "Между точками значение переходит линейно. До первой и после последней "
+            "точки оно держится. Шум — случайная добавка в пределах ±. "
+            "Время — локальное время машины, где запущена панель.</p></header>"
+        )
+        parts.extend(_schedule_sections(devices, by_address, schedules, names))
+        parts.append("</section></main></div></body></html>")
         return "\n".join(parts)
 
 
@@ -343,6 +374,7 @@ def _handler_class(app: AdminApp) -> type[BaseHTTPRequestHandler]:
                 page = app.render(
                     notice=_first(query, "ok"),
                     error=_first(query, "err"),
+                    view=_first(query, "view"),
                 )
             self._send(200, page, "text/html; charset=utf-8")
 
@@ -353,24 +385,24 @@ def _handler_class(app: AdminApp) -> type[BaseHTTPRequestHandler]:
                 with app.lock:
                     if parsed.path == "/devices":
                         app.save_device(form)
-                        self._redirect("/?ok=" + quote("Устройство записано"))
+                        self._redirect(_done("sensors", "Устройство записано"))
                         return
                     if parsed.path == "/readings":
                         app.save_readings(form)
-                        self._redirect("/?ok=" + quote("Показание записано"))
+                        self._redirect(_done("readings", "Показание записано"))
                         return
                     if parsed.path == "/schedules":
                         app.save_schedule(form)
-                        self._redirect("/?ok=" + quote("Расписание записано"))
+                        self._redirect(_done("schedules", "Расписание записано"))
                         return
                     if parsed.path == "/schedules/stop":
                         app.stop_schedule(form)
-                        self._redirect("/?ok=" + quote("Расписание остановлено"))
+                        self._redirect(_done("schedules", "Расписание остановлено"))
                         return
                 self._send(404, "not found\n", "text/plain; charset=utf-8")
             except FormError as exc:
                 with app.lock:
-                    page = app.render(error=exc.message)
+                    page = app.render(error=exc.message, view=_view_for_path(parsed.path))
                 self._send(400, page, "text/html; charset=utf-8")
             except (UnicodeDecodeError, ValueError):
                 self._send(400, "bad request\n", "text/plain; charset=utf-8")
@@ -627,22 +659,37 @@ def _parse_keyframes(form: dict[str, list[str]]) -> list[Keyframe]:
     return points
 
 
+def _nav_link(view: str, current: str, label: str, count: int | None = None) -> str:
+    current_attr = ' aria-current="page"' if view == current else ""
+    badge = f'<span class="badge">{count}</span>' if count else ""
+    return (
+        f'<a class="{"active" if view == current else ""}" '
+        f'href="/?view={view}"{current_attr}><span>{_esc(label)}</span>{badge}</a>'
+    )
+
+
+def _done(view: str, message: str) -> str:
+    return f"/?view={view}&ok={quote(message)}"
+
+
+def _view_for_path(path: str) -> str:
+    if path == "/readings":
+        return "readings"
+    if path in ("/schedules", "/schedules/stop"):
+        return "schedules"
+    return "sensors"
+
+
 def _schedule_sections(
     devices: list[DeviceRow],
     by_address: dict[int, list[MetricCatalogRow]],
     schedules: list[VirtualSchedule],
     names: dict[tuple[int, int], MetricCatalogRow],
 ) -> list[str]:
-    parts = ["<h2>Расписание</h2>"]
-    parts.append(
-        "<p>Пока панель запущена, показание пишется с заданным шагом. "
-        "Между точками значение переходит линейно. До первой и после последней "
-        "точки оно держится. Шум — случайная добавка в пределах ± на каждое показание. "
-        "Время — локальное время машины, где запущена панель.</p>"
-    )
+    parts = ['<section class="card" id="schedule">', "<h2>Активные расписания</h2>"]
     if schedules:
         parts.append(
-            "<table><thead><tr>"
+            '<div class="table-wrap"><table><thead><tr>'
             "<th>Адрес</th><th>Метрика</th><th>Шаг, с</th><th>Шум ±</th>"
             "<th>Сейчас без шума</th><th>Точки</th><th></th>"
             "</tr></thead><tbody>"
@@ -663,19 +710,21 @@ def _schedule_sections(
                 f"<td>{_esc(label)} #{schedule.metric_id}</td>"
                 f"<td>{_esc(f'{schedule.step_s:.6g}')}</td>"
                 f"<td>{_esc(f'{schedule.noise:.6g}')}</td>"
-                f"<td>{_esc(current)}</td>"
+                f"<td class=\"num\">{_esc(current)}</td>"
                 f"<td>{_esc(point_text)}</td>"
                 "<td>"
                 '<form class="inline" method="post" action="/schedules/stop" accept-charset="utf-8">'
                 f'<input type="hidden" name="address" value="{schedule.address}">'
                 f'<input type="hidden" name="metric_id" value="{schedule.metric_id}">'
-                '<button type="submit">Остановить</button>'
+                '<button class="quiet" type="submit">Остановить</button>'
                 "</form></td>"
                 "</tr>"
             )
-        parts.append("</tbody></table>")
+        parts.append("</tbody></table></div>")
     else:
-        parts.append("<p>Активных расписаний нет.</p>")
+        parts.append('<p class="empty">Активных расписаний нет.</p>')
+    parts.append("</section>")
+    parts.append('<section class="card"><h2>Новое расписание</h2>')
 
     numeric_found = False
     for device in devices:
@@ -697,8 +746,10 @@ def _schedule_sections(
                 f'<input type="hidden" name="metric_id" value="{metric.metric_id}">'
             )
             parts.append(
+                '<div class="pair">'
                 '<label>Шаг, секунды <input name="step_s" required inputmode="decimal"></label>'
                 '<label>Шум ± <input name="noise" value="0" inputmode="decimal"></label>'
+                "</div>"
             )
             parts.append('<div class="kf-head"><span>Время</span><span>Значение</span></div>')
             for _ in range(KEYFRAME_SLOTS):
@@ -708,11 +759,14 @@ def _schedule_sections(
                     '<input name="kf_value" inputmode="decimal">'
                     "</div>"
                 )
-            parts.append('<button type="submit">Записать расписание</button></form>')
+            parts.append(
+                '<button class="primary" type="submit">Записать расписание</button></form>'
+            )
     if devices and not numeric_found:
-        parts.append("<p>Числовых метрик нет — расписание не к чему привязать.</p>")
+        parts.append('<p class="empty">Числовых метрик нет — расписание не к чему привязать.</p>')
     elif not devices:
-        parts.append("<p>Сначала запишите устройство.</p>")
+        parts.append('<p class="empty">Сначала запишите устройство.</p>')
+    parts.append("</section>")
     return parts
 
 
@@ -752,13 +806,14 @@ def _device_row(device: DeviceRow, metrics: list[MetricCatalogRow]) -> str:
         for m in metrics
     )
     online = "да" if device.online else "нет"
+    online_class = "on" if device.online else "off"
     return (
         "<tr>"
         f"<td>{device.address}</td>"
         f"<td>{_esc(device.name)}</td>"
         f"<td>{device.fw_major}.{device.fw_minor}</td>"
         f"<td>{device.poll_interval_ms}</td>"
-        f"<td>{online}</td>"
+        f'<td><span class="pill {online_class}">{online}</span></td>'
         f"<td>{_esc(seen)}</td>"
         f"<td>{_esc(metric_text)}</td>"
         "</tr>"
@@ -770,20 +825,147 @@ def _esc(value: object) -> str:
 
 
 _CSS = """
-body { font-family: sans-serif; max-width: 60rem; margin: 2rem auto; padding: 0 1rem; color: #1c1c1c; }
-h1 { margin-bottom: 0.4rem; }
-.lede { color: #333; }
-code { font-family: ui-monospace, monospace; }
-table { border-collapse: collapse; width: 100%; margin: 0.5rem 0 1.5rem; }
-th, td { border-bottom: 1px solid #ddd; text-align: left; padding: 0.35rem 0.45rem; vertical-align: top; }
-form { margin: 0 0 1.4rem; padding: 0.8rem 0; border-top: 1px solid #eee; }
-form.inline { border: 0; margin: 0; padding: 0; }
-form.inline button { margin-top: 0; }
-label { display: block; margin: 0.45rem 0; }
-input, select, button { font: inherit; padding: 0.25rem 0.4rem; }
-button { margin-top: 0.6rem; }
-.metric-head, .metric-row { display: grid; grid-template-columns: 4.5rem 1fr 8rem 8rem; gap: 0.4rem; margin: 0.25rem 0; }
-.kf-head, .kf-row { display: grid; grid-template-columns: 1fr 10rem; gap: 0.4rem; margin: 0.25rem 0; }
-.ok { background: #e7f6e7; padding: 0.5rem 0.7rem; }
-.error { background: #fde8e8; padding: 0.5rem 0.7rem; }
+:root {
+  --bg: #efeae2;
+  --ink: #1e2a26;
+  --muted: #5e6a64;
+  --line: #e4dbd0;
+  --card: #fffdf9;
+  --accent: #1c6b5a;
+  --side: #1c2824;
+  --side-ink: #e8f0eb;
+  --side-dim: #b7c4bb;
+  --ok-bg: #e6f6ec;
+  --ok-ink: #1a6840;
+  --err-bg: #fdecea;
+  --err-ink: #8d2f2f;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  color: var(--ink);
+  background: var(--bg);
+  font-family: "Segoe UI", "Avenir Next", system-ui, sans-serif;
+  line-height: 1.45;
+}
+.app { display: flex; min-height: 100vh; }
+.side {
+  width: 17.5rem;
+  flex: none;
+  background: var(--side);
+  color: var(--side-ink);
+  padding: 1.4rem 1rem 1.2rem;
+  display: flex;
+  flex-direction: column;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+}
+.brand { display: flex; gap: 0.75rem; align-items: center; padding: 0 0.4rem 1.2rem; }
+.mark {
+  width: 2.2rem; height: 2.2rem; border-radius: 0.7rem;
+  display: grid; place-items: center;
+  background: #2f6f5c; color: white; font-weight: 700;
+}
+.brand strong { display: block; font-size: 1.05rem; letter-spacing: 0.01em; }
+.brand span { color: var(--side-dim); font-size: 0.82rem; }
+.side nav { display: flex; flex-direction: column; gap: 0.35rem; }
+.side a {
+  color: var(--side-ink);
+  text-decoration: none;
+  padding: 0.72rem 0.8rem;
+  border-radius: 0.7rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 0.6rem;
+}
+.side a > span:first-child { flex: 1; }
+.side a:hover { background: rgba(255, 255, 255, 0.06); }
+.side a.active { background: #31584b; }
+.badge {
+  min-width: 1.4rem; text-align: center;
+  background: #e7f3ee; color: #1c6b5a;
+  border-radius: 999px; font-size: 0.75rem; padding: 0.05rem 0.4rem;
+}
+.side-db { margin-top: auto; color: #d5e0d8; font-size: 0.82rem; padding: 1rem 0.45rem 0.2rem; }
+.side-db code { color: #f7fbf8; word-break: break-all; }
+.side-db span { display: inline-block; margin-top: 0.25rem; }
+main { flex: 1; padding: 1.6rem 1.8rem 2.5rem; max-width: 68rem; }
+.panel { display: none; }
+body.view-sensors .panel-sensors,
+body.view-readings .panel-readings,
+body.view-schedules .panel-schedules { display: block; }
+.panel-head { margin: 0 0 1rem; }
+.panel-head h1 { margin: 0 0 0.35rem; font-size: 1.7rem; font-weight: 650; }
+.hint { margin: 0; color: var(--muted); max-width: 42rem; }
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 1rem 1.15rem 1.15rem;
+  margin: 0 0 1rem;
+  box-shadow: 0 10px 28px rgba(48, 36, 22, 0.05);
+}
+.card h2 { margin: 0 0 0.8rem; font-size: 1.05rem; }
+.card h3 { margin: 0.2rem 0 0.6rem; font-size: 1rem; }
+.banner { border-radius: 10px; padding: 0.7rem 0.9rem; margin: 0 0 1rem; }
+.banner.ok { background: var(--ok-bg); color: var(--ok-ink); }
+.banner.error { background: var(--err-bg); color: var(--err-ink); }
+.empty { color: var(--muted); margin: 0.2rem 0 0.4rem; }
+code { font-family: ui-monospace, "Cascadia Code", monospace; font-size: 0.92em; }
+.table-wrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: 0.55rem 0.6rem; vertical-align: top; border-bottom: 1px solid var(--line); }
+th { color: var(--muted); font-weight: 600; font-size: 0.78rem; letter-spacing: 0.03em; text-transform: uppercase; }
+tr:last-child td { border-bottom: 0; }
+td.num { font-variant-numeric: tabular-nums; }
+form { margin: 0; }
+form + form { margin-top: 1.1rem; padding-top: 1rem; border-top: 1px solid var(--line); }
+form.inline { margin: 0; padding: 0; border: 0; }
+label { display: block; margin: 0.55rem 0; color: var(--muted); font-size: 0.86rem; }
+input, select {
+  display: block; width: 100%; margin-top: 0.25rem;
+  font: inherit; color: var(--ink); background: white;
+  border: 1px solid #ddd4c8; border-radius: 8px; padding: 0.45rem 0.55rem;
+}
+input:focus, select:focus {
+  outline: none; border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(28, 107, 90, 0.16);
+}
+.pair { display: grid; grid-template-columns: 1fr 1fr; gap: 0.8rem; }
+.metric-head, .kf-head {
+  display: grid; gap: 0.45rem; margin: 0.8rem 0 0.3rem;
+  color: var(--muted); font-size: 0.78rem; letter-spacing: 0.03em; text-transform: uppercase;
+}
+.metric-head, .metric-row { grid-template-columns: 4.5rem 1fr 8rem 8rem; }
+.kf-head, .kf-row { grid-template-columns: 1fr 10rem; }
+.metric-row, .kf-row { display: grid; gap: 0.45rem; margin: 0.3rem 0; }
+.metric-row input, .metric-row select, .kf-row input { margin-top: 0; }
+button {
+  font: inherit; cursor: pointer; border-radius: 9px; padding: 0.55rem 0.95rem; margin-top: 0.85rem;
+}
+button.primary { background: var(--accent); color: white; border: 0; }
+button.primary:hover { background: #17594b; }
+button.quiet {
+  margin-top: 0; background: transparent; color: #8a4034;
+  border: 1px solid #ead5ce; padding: 0.35rem 0.65rem;
+}
+button.quiet:hover { background: #fdf4f2; }
+.pill {
+  display: inline-block; border-radius: 999px; padding: 0.08rem 0.5rem;
+  font-size: 0.78rem; background: #f1ece4; color: var(--muted);
+}
+.pill.on, .pill.virtual { background: var(--ok-bg); color: var(--ok-ink); }
+.pill.off, .pill.bus { background: #f3eee6; color: #6a6258; }
+@media (max-width: 860px) {
+  .app { display: block; }
+  .side { position: static; width: auto; height: auto; }
+  .side nav { flex-direction: row; overflow-x: auto; }
+  .side a { min-width: 14rem; }
+  .side-db { margin-top: 1rem; }
+  main { padding: 1rem; }
+  .pair, .metric-head, .metric-row { grid-template-columns: 1fr 1fr; }
+  .metric-head span:nth-child(n+3) { display: none; }
+}
 """
