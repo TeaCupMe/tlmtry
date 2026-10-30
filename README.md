@@ -98,6 +98,7 @@ device.setPollIntervalMs(2000);
 | `run --sim` | То же со встроенным симулятором шины |
 | `discover` | Разовое сканирование устройств |
 | `replicate --to PATH_OR_URL` | Инкрементальная выгрузка в резервную SQLite или PostgreSQL |
+| `admin` | Страница виртуальных устройств, разовых показаний и расписаний |
 | `status` | Устройства и число сэмплов |
 
 Как устроен один проход и как вызвать его из внешнего скрипта: [docs/replication.md](docs/replication.md).
@@ -108,6 +109,42 @@ device.setPollIntervalMs(2000);
 python3 scripts/export_replication.py --database /tmp/tlmtry-primary.db --from-id 1 --output /tmp/tlmtry-batch.json
 python3 scripts/import_replication.py --database /tmp/tlmtry-backup.db --input /tmp/tlmtry-batch.json
 ```
+
+## Админ-панель
+
+Страница пишет виртуальное устройство и показания в ту же базу, что и сборщик. Строки попадают в `samples` с `quality = 1` и с тем `metric_id`, который указан у метрики (по умолчанию номер строки, с 0). Опрос шины пишет `quality = 0`, репликация переносит признак как есть. К шине RS-485 панель не подключается.
+
+На странице три вкладки: датчики, разовые показания и расписания. Уже запущенные расписания видны вверху вкладки расписаний.
+
+Разовое показание вводится формой. Расписание пишет само, пока процесс панели запущен: шаг в секундах, точки «время → значение», между точками линейный переход, до первой и после последней значение держится. Шум — равномерная добавка в пределах ± к каждому такому показанию.
+
+База выбирается так: `--database`, иначе переменная `TLMTRY_DATABASE`, иначе поле `database` из `--config`, иначе `data/primary.db`.
+
+```bash
+tlmtry-collector admin --database /tmp/tlmtry-primary.db
+# http://127.0.0.1:8765
+```
+
+`--host` и `--port` меняют адрес (по умолчанию `127.0.0.1:8765`).
+
+Отдельный контейнер только для панели (сборщик на COM/USB по-прежнему на хосте):
+
+```bash
+docker compose -f deploy/docker-compose.admin.yml up --build
+# http://127.0.0.1:8765
+# SQLite внутри тома: /data/primary.db
+```
+
+Postgres на хосте:
+
+```bash
+TLMTRY_DATABASE='postgresql://tlmtry:secret@host.docker.internal:5432/tlmtry' \
+  docker compose -f deploy/docker-compose.admin.yml up --build
+```
+
+Время точек расписания — локальное время контейнера. Образ ставит `TZ=Europe/Moscow`, в compose то же имя можно переопределить переменной `TZ`.
+
+Адрес виртуального устройства не должен совпадать с живым узлом на шине: следующий `DISCOVER` перезапишет манифест этого адреса.
 
 ## Тесты
 

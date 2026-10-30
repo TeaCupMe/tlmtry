@@ -15,6 +15,7 @@ from typing import Any, Iterator, Literal
 from urllib.parse import urlparse, urlunparse
 
 from .protocol import DeviceManifest, MetricType, SampleValue
+from .schedule import Keyframe, VirtualSchedule
 
 Backend = Literal["sqlite", "postgres"]
 
@@ -61,6 +62,25 @@ CREATE TABLE IF NOT EXISTS replication_state (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS virtual_schedules (
+    address INTEGER NOT NULL,
+    metric_id INTEGER NOT NULL,
+    step_s REAL NOT NULL,
+    noise REAL NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    last_emit_ts REAL,
+    PRIMARY KEY (address, metric_id)
+);
+
+CREATE TABLE IF NOT EXISTS virtual_keyframes (
+    address INTEGER NOT NULL,
+    metric_id INTEGER NOT NULL,
+    ts REAL NOT NULL,
+    value REAL NOT NULL,
+    noise REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (address, metric_id, ts)
+);
 """
 
 # Alias kept for replicate.py / callers that apply schema to a SQLite backup.
@@ -105,6 +125,25 @@ CREATE INDEX IF NOT EXISTS idx_samples_addr_ts ON samples(address, ts);
 CREATE TABLE IF NOT EXISTS replication_state (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS virtual_schedules (
+    address INTEGER NOT NULL,
+    metric_id INTEGER NOT NULL,
+    step_s DOUBLE PRECISION NOT NULL,
+    noise DOUBLE PRECISION NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    last_emit_ts DOUBLE PRECISION,
+    PRIMARY KEY (address, metric_id)
+);
+
+CREATE TABLE IF NOT EXISTS virtual_keyframes (
+    address INTEGER NOT NULL,
+    metric_id INTEGER NOT NULL,
+    ts DOUBLE PRECISION NOT NULL,
+    value DOUBLE PRECISION NOT NULL,
+    noise DOUBLE PRECISION NOT NULL DEFAULT 0,
+    PRIMARY KEY (address, metric_id, ts)
 );
 """
 
@@ -181,6 +220,7 @@ class Storage:
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SQLITE_SCHEMA)
         self._conn.commit()
+        self._migrate_keyframe_noise()
 
     def _init_postgres(self, dsn: str) -> None:
         try:
@@ -200,6 +240,57 @@ class Storage:
         with self._conn.cursor() as cur:
             for statement in statements:
                 cur.execute(statement)
+        self._conn.commit()
+        self._migrate_keyframe_noise()
+
+    def _migrate_keyframe_noise(self) -> None:
+        """Add per-keyframe noise on older databases and seed from schedule noise."""
+        if self.backend == "sqlite":
+            cols = {
+                row[1]
+                for row in self._conn.execute("PRAGMA table_info(virtual_keyframes)")
+            }
+            if "noise" in cols:
+                return
+            self._conn.execute(
+                "ALTER TABLE virtual_keyframes ADD COLUMN noise REAL NOT NULL DEFAULT 0"
+            )
+            self._conn.execute(
+                """
+                UPDATE virtual_keyframes
+                SET noise = COALESCE(
+                    (
+                        SELECT noise FROM virtual_schedules AS s
+                        WHERE s.address = virtual_keyframes.address
+                          AND s.metric_id = virtual_keyframes.metric_id
+                    ),
+                    0
+                )
+                """
+            )
+            self._conn.commit()
+            return
+
+        row = self._fetchone(
+            """
+            SELECT 1 AS ok
+            FROM information_schema.columns
+            WHERE table_name = 'virtual_keyframes' AND column_name = 'noise'
+            """
+        )
+        if row is not None:
+            return
+        self._execute(
+            "ALTER TABLE virtual_keyframes ADD COLUMN noise DOUBLE PRECISION NOT NULL DEFAULT 0"
+        )
+        self._execute(
+            """
+            UPDATE virtual_keyframes AS k
+            SET noise = s.noise
+            FROM virtual_schedules AS s
+            WHERE s.address = k.address AND s.metric_id = k.metric_id
+            """
+        )
         self._conn.commit()
 
     @property
@@ -356,7 +447,11 @@ class Storage:
                 )
 
     def insert_samples(
-        self, address: int, samples: list[SampleValue], ts: float | None = None
+        self,
+        address: int,
+        samples: list[SampleValue],
+        ts: float | None = None,
+        quality: int = 0,
     ) -> None:
         if not samples:
             return
@@ -378,7 +473,7 @@ class Storage:
                     """
                     INSERT INTO samples(
                         address, metric_id, ts, value_real, value_text, type, quality
-                    ) VALUES (?, ?, ?, ?, ?, ?, 0)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         address,
@@ -387,6 +482,7 @@ class Storage:
                         value_real,
                         value_text,
                         int(s.type),
+                        int(quality),
                     ),
                 )
             self._execute(
@@ -397,6 +493,30 @@ class Storage:
     def sample_count(self) -> int:
         row = self._fetchone("SELECT COUNT(*) AS c FROM samples")
         return int(self._row_get(row, "c"))
+
+    def list_recent_samples(self, limit: int = 50) -> list[SampleRow]:
+        """Newest samples first. ``limit`` is clamped to 1..500."""
+        capped = min(max(int(limit), 1), 500)
+        rows = self._fetchall(
+            """
+            SELECT id, address, metric_id, ts, value_real, value_text, type, quality
+            FROM samples ORDER BY id DESC LIMIT ?
+            """,
+            (capped,),
+        )
+        return [
+            SampleRow(
+                id=int(self._row_get(r, "id")),
+                address=int(self._row_get(r, "address")),
+                metric_id=int(self._row_get(r, "metric_id")),
+                ts=float(self._row_get(r, "ts")),
+                value_real=self._row_get(r, "value_real"),
+                value_text=self._row_get(r, "value_text"),
+                type=int(self._row_get(r, "type")),
+                quality=int(self._row_get(r, "quality")),
+            )
+            for r in rows
+        ]
 
     def sample_ids_present(self, ids: list[int]) -> set[int]:
         """Return the subset of sample ids that already exist."""
@@ -549,6 +669,113 @@ class Storage:
                 """,
                 ("last_replicate_ts", str(stamp)),
             )
+
+    def replace_schedule(self, schedule: VirtualSchedule) -> None:
+        points = sorted(schedule.keyframes, key=lambda item: item.ts)
+        with self.transaction():
+            self._execute(
+                """
+                INSERT INTO virtual_schedules(
+                    address, metric_id, step_s, noise, enabled, last_emit_ts
+                ) VALUES (?, ?, ?, ?, 1, NULL)
+                ON CONFLICT(address, metric_id) DO UPDATE SET
+                    step_s=excluded.step_s,
+                    noise=excluded.noise,
+                    enabled=1,
+                    last_emit_ts=NULL
+                """,
+                (
+                    schedule.address,
+                    schedule.metric_id,
+                    float(schedule.step_s),
+                    float(schedule.noise),
+                ),
+            )
+            self._execute(
+                "DELETE FROM virtual_keyframes WHERE address = ? AND metric_id = ?",
+                (schedule.address, schedule.metric_id),
+            )
+            for point in points:
+                self._execute(
+                    """
+                    INSERT INTO virtual_keyframes(address, metric_id, ts, value, noise)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        schedule.address,
+                        schedule.metric_id,
+                        point.ts,
+                        point.value,
+                        float(max(0.0, point.noise)),
+                    ),
+                )
+
+    def delete_schedule(self, address: int, metric_id: int) -> None:
+        with self.transaction():
+            self._execute(
+                "DELETE FROM virtual_keyframes WHERE address = ? AND metric_id = ?",
+                (address, metric_id),
+            )
+            self._execute(
+                "DELETE FROM virtual_schedules WHERE address = ? AND metric_id = ?",
+                (address, metric_id),
+            )
+
+    def mark_schedule_emitted(self, address: int, metric_id: int, ts: float) -> None:
+        with self.transaction():
+            self._execute(
+                """
+                UPDATE virtual_schedules SET last_emit_ts = ?
+                WHERE address = ? AND metric_id = ?
+                """,
+                (ts, address, metric_id),
+            )
+
+    def list_schedules(self) -> list[VirtualSchedule]:
+        rows = self._fetchall(
+            """
+            SELECT address, metric_id, step_s, noise, enabled, last_emit_ts
+            FROM virtual_schedules
+            ORDER BY address, metric_id
+            """
+        )
+        points = self._fetchall(
+            """
+            SELECT address, metric_id, ts, value, noise
+            FROM virtual_keyframes
+            ORDER BY ts
+            """
+        )
+        grouped: dict[tuple[int, int], list[Keyframe]] = {}
+        for point in points:
+            key = (
+                int(self._row_get(point, "address")),
+                int(self._row_get(point, "metric_id")),
+            )
+            grouped.setdefault(key, []).append(
+                Keyframe(
+                    ts=float(self._row_get(point, "ts")),
+                    value=float(self._row_get(point, "value")),
+                    noise=float(self._row_get(point, "noise")),
+                )
+            )
+        schedules: list[VirtualSchedule] = []
+        for row in rows:
+            address = int(self._row_get(row, "address"))
+            metric_id = int(self._row_get(row, "metric_id"))
+            last = self._row_get(row, "last_emit_ts")
+            schedules.append(
+                VirtualSchedule(
+                    address=address,
+                    metric_id=metric_id,
+                    step_s=float(self._row_get(row, "step_s")),
+                    noise=float(self._row_get(row, "noise")),
+                    enabled=bool(self._row_get(row, "enabled")),
+                    last_emit_ts=None if last is None else float(last),
+                    keyframes=grouped.get((address, metric_id), []),
+                )
+            )
+        return schedules
 
     def connection(self) -> Any:
         """Return the raw DB-API connection (sqlite3 or psycopg)."""

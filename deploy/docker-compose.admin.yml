@@ -1,0 +1,28 @@
+# Admin panel only. The RS-485 collector stays on the host.
+# From the repository root:
+#   docker compose -f deploy/docker-compose.admin.yml up --build
+#
+# SQLite in the volume (default):
+#   database file is /data/primary.db inside the container.
+# Postgres on the host, from the container:
+#   TLMTRY_DATABASE=postgresql://tlmtry:secret@host.docker.internal:5432/tlmtry \
+#     docker compose -f deploy/docker-compose.admin.yml up --build
+
+services:
+  admin:
+    build:
+      context: ..
+      dockerfile: deploy/admin.Dockerfile
+    ports:
+      - "8765:8765"
+    environment:
+      TZ: ${TZ:-Europe/Moscow}
+      TLMTRY_DATABASE: ${TLMTRY_DATABASE:-/data/primary.db}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - admin-data:/data
+    restart: unless-stopped
+
+volumes:
+  admin-data:
