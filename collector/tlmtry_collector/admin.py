@@ -813,11 +813,24 @@ def _schedule_form(
         f'<input name="step_s" required inputmode="decimal" value="{_esc(step_value)}">'
         "</label>",
         '<div class="kf-editor">',
-        '<svg class="kf-chart" viewBox="0 0 640 240" tabindex="0" role="img" '
-        'aria-label="График ключевых точек"></svg>',
-        '<p class="kf-chart-hint">Клик по графику — добавить точку; перетащить — '
-        "сдвинуть; Delete — удалить выбранную. Полоса вокруг линии — шум "
-        "промежутка (± у левой точки).</p>",
+        '<div class="kf-toolbar">'
+        '<label>Окно с '
+        '<input type="datetime-local" class="kf-tmin" step="1">'
+        "</label>"
+        '<label>по '
+        '<input type="datetime-local" class="kf-tmax" step="1">'
+        "</label>"
+        '<div class="kf-tools">'
+        '<button type="button" class="quiet kf-fit" title="Подогнать окно по точкам">'
+        "По точкам</button>"
+        '<button type="button" class="quiet kf-zoom-out" title="Отдалить время">−</button>'
+        '<button type="button" class="quiet kf-zoom-in" title="Приблизить время">+</button>'
+        "</div></div>",
+        '<svg class="kf-chart" viewBox="0 0 640 240" preserveAspectRatio="xMidYMid meet" '
+        'tabindex="0" role="img" aria-label="График ключевых точек"></svg>',
+        '<p class="kf-chart-hint">Клик — добавить точку; перетащить — сдвинуть; '
+        "Delete — удалить. Колесо / ± — масштаб по времени, Shift+перетаскивание — "
+        "сдвиг окна. Полоса вокруг линии — шум промежутка (± у левой точки).</p>",
         '<div class="kf-head">'
         "<span>Время</span><span>Значение</span>"
         "<span>Шум ± до след.</span></div>",
@@ -1112,11 +1125,36 @@ td.actions { white-space: nowrap; }
 .device-group-body form:first-child { margin-top: 0.75rem; }
 .device-group-body form + form { margin-top: 1rem; }
 .kf-editor { margin: 0.75rem 0 0.2rem; }
+.kf-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem 0.7rem;
+  align-items: flex-end;
+  margin: 0 0 0.45rem;
+}
+.kf-toolbar > label {
+  margin: 0;
+  flex: 1 1 11rem;
+  min-width: 10rem;
+}
+.kf-toolbar > label input { margin-top: 0.2rem; }
+.kf-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  align-items: center;
+  padding-bottom: 0.05rem;
+}
+.kf-tools button {
+  margin-top: 0;
+  min-width: 2rem;
+}
 .kf-chart {
   display: block;
   width: 100%;
   height: auto;
-  max-height: 260px;
+  aspect-ratio: 640 / 240;
+  max-height: 280px;
   background: #f7f3ec;
   border: 1px solid var(--line);
   border-radius: 10px;
@@ -1129,6 +1167,7 @@ td.actions { white-space: nowrap; }
   border-color: var(--accent);
   box-shadow: 0 0 0 3px rgba(28, 107, 90, 0.16);
 }
+.kf-chart.panning { cursor: grabbing; }
 .kf-chart-hint {
   margin: 0.35rem 0 0.55rem;
   color: var(--muted);
@@ -1168,6 +1207,10 @@ _SCHEDULE_JS = r"""
   var W = 640;
   var H = 240;
   var HIT = 10;
+  var MIN_SPAN = 60;
+  var MAX_SPAN = 86400 * 30;
+  var DEFAULT_AHEAD = 4 * 3600;
+  var DEFAULT_BACK = 300;
 
   function pad2(n) {
     return (n < 10 ? "0" : "") + n;
@@ -1193,7 +1236,8 @@ _SCHEDULE_JS = r"""
   function formatAxisTime(ts, span) {
     var d = new Date(ts * 1000);
     if (span >= 86400 * 2) {
-      return pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()) + " " + pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+      return pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()) + " " +
+        pad2(d.getHours()) + ":" + pad2(d.getMinutes());
     }
     return pad2(d.getHours()) + ":" + pad2(d.getMinutes()) + ":" + pad2(d.getSeconds());
   }
@@ -1215,13 +1259,87 @@ _SCHEDULE_JS = r"""
     return el;
   }
 
+  function clampSpan(tMin, tMax) {
+    var span = tMax - tMin;
+    if (!(span > 0) || !isFinite(span)) {
+      var mid = isFinite(tMin) ? tMin : (Date.now() / 1000);
+      return { tMin: mid - 1800, tMax: mid + 1800 };
+    }
+    if (span < MIN_SPAN) {
+      var c = (tMin + tMax) / 2;
+      return { tMin: c - MIN_SPAN / 2, tMax: c + MIN_SPAN / 2 };
+    }
+    if (span > MAX_SPAN) {
+      var c2 = (tMin + tMax) / 2;
+      return { tMin: c2 - MAX_SPAN / 2, tMax: c2 + MAX_SPAN / 2 };
+    }
+    return { tMin: tMin, tMax: tMax };
+  }
+
+  function defaultTimeWindow() {
+    var now = Date.now() / 1000;
+    return { tMin: now - DEFAULT_BACK, tMax: now + DEFAULT_AHEAD };
+  }
+
+  function fitTimeToPoints(points) {
+    if (!points.length) return defaultTimeWindow();
+    var tMin = points[0].ts;
+    var tMax = points[0].ts;
+    points.forEach(function (p) {
+      if (p.ts < tMin) tMin = p.ts;
+      if (p.ts > tMax) tMax = p.ts;
+    });
+    if (tMax <= tMin) {
+      tMin -= 1800;
+      tMax += 1800;
+    } else {
+      var tPad = Math.max((tMax - tMin) * 0.08, 60);
+      tMin -= tPad;
+      tMax += tPad;
+    }
+    return clampSpan(tMin, tMax);
+  }
+
+  function valueBounds(points) {
+    var vMin = 0;
+    var vMax = 1;
+    if (points.length) {
+      vMin = points[0].value;
+      vMax = points[0].value;
+      points.forEach(function (p) {
+        var lo = p.value - p.noise;
+        var hi = p.value + p.noise;
+        if (lo < vMin) vMin = lo;
+        if (hi > vMax) vMax = hi;
+      });
+    }
+    if (vMax <= vMin) {
+      vMin -= 1;
+      vMax += 1;
+    } else {
+      var vPad = (vMax - vMin) * 0.12;
+      if (vPad === 0) vPad = 1;
+      vMin -= vPad;
+      vMax += vPad;
+    }
+    return { vMin: vMin, vMax: vMax };
+  }
+
   function bindEditor(form) {
     var svg = form.querySelector(".kf-chart");
     if (!svg) return;
     var rows = Array.prototype.slice.call(form.querySelectorAll(".kf-row"));
+    var tMinInput = form.querySelector(".kf-tmin");
+    var tMaxInput = form.querySelector(".kf-tmax");
+    var fitBtn = form.querySelector(".kf-fit");
+    var zoomInBtn = form.querySelector(".kf-zoom-in");
+    var zoomOutBtn = form.querySelector(".kf-zoom-out");
     var selected = -1;
     var drag = null;
+    var pan = null;
     var syncing = false;
+    var syncingView = false;
+    var view = null;
 
     function readPoints() {
       var out = [];
@@ -1290,44 +1408,32 @@ _SCHEDULE_JS = r"""
       return -1;
     }
 
+    function ensureView(points) {
+      if (!view) {
+        view = points.length ? fitTimeToPoints(points) : defaultTimeWindow();
+      } else {
+        view = clampSpan(view.tMin, view.tMax);
+      }
+      return view;
+    }
+
+    function setView(tMin, tMax, syncInputs) {
+      view = clampSpan(tMin, tMax);
+      if (syncInputs !== false) syncViewInputs();
+    }
+
+    function syncViewInputs() {
+      if (!tMinInput || !tMaxInput || !view) return;
+      syncingView = true;
+      tMinInput.value = formatLocalInput(view.tMin);
+      tMaxInput.value = formatLocalInput(view.tMax);
+      syncingView = false;
+    }
+
     function bounds(points) {
-      var now = Date.now() / 1000;
-      var tMin = now;
-      var tMax = now + 3600;
-      var vMin = 0;
-      var vMax = 1;
-      if (points.length) {
-        tMin = points[0].ts;
-        tMax = points[points.length - 1].ts;
-        vMin = points[0].value;
-        vMax = points[0].value;
-        points.forEach(function (p) {
-          if (p.ts < tMin) tMin = p.ts;
-          if (p.ts > tMax) tMax = p.ts;
-          var lo = p.value - p.noise;
-          var hi = p.value + p.noise;
-          if (lo < vMin) vMin = lo;
-          if (hi > vMax) vMax = hi;
-        });
-      }
-      if (tMax <= tMin) {
-        tMin -= 1800;
-        tMax += 1800;
-      } else {
-        var tPad = Math.max((tMax - tMin) * 0.08, 60);
-        tMin -= tPad;
-        tMax += tPad;
-      }
-      if (vMax <= vMin) {
-        vMin -= 1;
-        vMax += 1;
-      } else {
-        var vPad = (vMax - vMin) * 0.12;
-        if (vPad === 0) vPad = 1;
-        vMin -= vPad;
-        vMax += vPad;
-      }
-      return { tMin: tMin, tMax: tMax, vMin: vMin, vMax: vMax };
+      var t = ensureView(points);
+      var v = valueBounds(points);
+      return { tMin: t.tMin, tMax: t.tMax, vMin: v.vMin, vMax: v.vMax };
     }
 
     function xOf(ts, b) {
@@ -1346,16 +1452,37 @@ _SCHEDULE_JS = r"""
       return b.vMin + (1 - (y - PAD.t) / (H - PAD.t - PAD.b)) * (b.vMax - b.vMin);
     }
 
+    // Screen → SVG user space via CTM. Avoids offsetX and CSS-box/viewBox mismatch
+    // when width/height aspect differs from viewBox (letterboxing under "meet").
     function clientToSvg(evt) {
+      var ctm = svg.getScreenCTM();
+      if (ctm) {
+        var inv = ctm.inverse();
+        return {
+          x: inv.a * evt.clientX + inv.c * evt.clientY + inv.e,
+          y: inv.b * evt.clientX + inv.d * evt.clientY + inv.f
+        };
+      }
       var rect = svg.getBoundingClientRect();
-      var x = ((evt.clientX - rect.left) / rect.width) * W;
-      var y = ((evt.clientY - rect.top) / rect.height) * H;
-      return { x: x, y: y };
+      if (!(rect.width > 0) || !(rect.height > 0)) return { x: 0, y: 0 };
+      var vb = svg.viewBox && svg.viewBox.baseVal;
+      var vw = vb && vb.width ? vb.width : W;
+      var vh = vb && vb.height ? vb.height : H;
+      var sx = rect.width / vw;
+      var sy = rect.height / vh;
+      var scale = Math.min(sx, sy);
+      var ox = (rect.width - vw * scale) / 2;
+      var oy = (rect.height - vh * scale) / 2;
+      return {
+        x: (evt.clientX - rect.left - ox) / scale,
+        y: (evt.clientY - rect.top - oy) / scale
+      };
     }
 
     function draw() {
       var points = readPoints();
       var b = bounds(points);
+      syncViewInputs();
       while (svg.firstChild) svg.removeChild(svg.firstChild);
 
       var gGrid = svgEl("g");
@@ -1496,14 +1623,47 @@ _SCHEDULE_JS = r"""
       return best;
     }
 
+    function zoomTime(factor, anchorTs) {
+      var points = readPoints();
+      var b = bounds(points);
+      var mid = isFinite(anchorTs) ? anchorTs : (b.tMin + b.tMax) / 2;
+      var span = (b.tMax - b.tMin) * factor;
+      var ratio = (mid - b.tMin) / (b.tMax - b.tMin);
+      if (!isFinite(ratio)) ratio = 0.5;
+      setView(mid - span * ratio, mid + span * (1 - ratio));
+      draw();
+    }
+
+    function applyViewInputs() {
+      if (!tMinInput || !tMaxInput) return;
+      var t0 = parseLocalInput(tMinInput.value);
+      var t1 = parseLocalInput(tMaxInput.value);
+      if (!isFinite(t0) || !isFinite(t1)) return;
+      if (t1 <= t0) t1 = t0 + MIN_SPAN;
+      setView(t0, t1, false);
+      draw();
+    }
+
     function onPointerDown(evt) {
-      if (evt.button != null && evt.button !== 0) return;
+      if (evt.button != null && evt.button !== 0 && evt.button !== 1) return;
       evt.preventDefault();
       var pos = clientToSvg(evt);
       var points = readPoints();
       var b = bounds(points);
-      var hit = hitIndex(pos, points, b);
       try { svg.focus({ preventScroll: true }); } catch (e) { try { svg.focus(); } catch (e2) {} }
+
+      if (evt.shiftKey || evt.button === 1) {
+        pan = {
+          pointerId: evt.pointerId,
+          lastX: pos.x,
+          scale: (b.tMax - b.tMin) / (W - PAD.l - PAD.r)
+        };
+        svg.classList.add("panning");
+        try { svg.setPointerCapture(evt.pointerId); } catch (e) {}
+        return;
+      }
+
+      var hit = hitIndex(pos, points, b);
       if (hit >= 0) {
         selected = hit;
         drag = {
@@ -1525,6 +1685,15 @@ _SCHEDULE_JS = r"""
     }
 
     function onPointerMove(evt) {
+      if (pan && pan.pointerId === evt.pointerId) {
+        evt.preventDefault();
+        var posP = clientToSvg(evt);
+        var dx = posP.x - pan.lastX;
+        setView(view.tMin - dx * pan.scale, view.tMax - dx * pan.scale);
+        pan.lastX = posP.x;
+        draw();
+        return;
+      }
       if (!drag || drag.pointerId !== evt.pointerId) return;
       evt.preventDefault();
       var pos = clientToSvg(evt);
@@ -1536,6 +1705,13 @@ _SCHEDULE_JS = r"""
     }
 
     function onPointerUp(evt) {
+      if (pan && pan.pointerId === evt.pointerId) {
+        pan = null;
+        svg.classList.remove("panning");
+        try { svg.releasePointerCapture(evt.pointerId); } catch (e) {}
+        draw();
+        return;
+      }
       if (!drag || drag.pointerId !== evt.pointerId) return;
       drag = null;
       try { svg.releasePointerCapture(evt.pointerId); } catch (e) {}
@@ -1553,11 +1729,47 @@ _SCHEDULE_JS = r"""
       draw();
     }
 
+    function onWheel(evt) {
+      evt.preventDefault();
+      var pos = clientToSvg(evt);
+      var b = bounds(readPoints());
+      var anchor = tsOf(Math.min(Math.max(pos.x, PAD.l), W - PAD.r), b);
+      var factor = evt.deltaY < 0 ? 0.8 : 1.25;
+      zoomTime(factor, anchor);
+    }
+
     svg.addEventListener("pointerdown", onPointerDown);
     svg.addEventListener("pointermove", onPointerMove);
     svg.addEventListener("pointerup", onPointerUp);
     svg.addEventListener("pointercancel", onPointerUp);
     svg.addEventListener("keydown", onKeyDown);
+    svg.addEventListener("wheel", onWheel, { passive: false });
+
+    if (tMinInput) {
+      tMinInput.addEventListener("change", function () {
+        if (syncingView) return;
+        applyViewInputs();
+      });
+    }
+    if (tMaxInput) {
+      tMaxInput.addEventListener("change", function () {
+        if (syncingView) return;
+        applyViewInputs();
+      });
+    }
+    if (fitBtn) {
+      fitBtn.addEventListener("click", function () {
+        var fitted = fitTimeToPoints(readPoints());
+        setView(fitted.tMin, fitted.tMax);
+        draw();
+      });
+    }
+    if (zoomInBtn) {
+      zoomInBtn.addEventListener("click", function () { zoomTime(0.7); });
+    }
+    if (zoomOutBtn) {
+      zoomOutBtn.addEventListener("click", function () { zoomTime(1.4); });
+    }
 
     rows.forEach(function (row) {
       row.querySelectorAll("input").forEach(function (input) {
