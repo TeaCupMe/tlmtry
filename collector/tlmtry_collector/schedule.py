@@ -1,8 +1,10 @@
 """Autonomous virtual readings: linear transitions between keyframes plus noise.
 
 Between two timestamps the value moves in a straight line. Before the first
-point and after the last one the value stays at that endpoint. Noise is a
-uniform offset in ``[-noise, +noise]`` added when a sample is written.
+point and after the last one the value stays at that endpoint. Each keyframe
+carries the noise amplitude for the segment that starts at that point (until
+the next keyframe, or while holding after the last one). Noise is a uniform
+offset in ``[-noise, +noise]`` added when a sample is written.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ _UINT16_MAX = 65535
 class Keyframe:
     ts: float
     value: float
+    noise: float = 0.0
 
 
 @dataclass
@@ -51,6 +54,19 @@ def interpolate(keyframes: list[Keyframe], ts: float) -> float:
             ratio = (ts - left.ts) / span
             return left.value + (right.value - left.value) * ratio
     return points[-1].value
+
+
+def noise_at(keyframes: list[Keyframe], ts: float) -> float:
+    """Noise amplitude for the segment that covers ``ts``."""
+    if not keyframes:
+        return 0.0
+    points = sorted(keyframes, key=lambda item: item.ts)
+    if ts < points[0].ts:
+        return max(0.0, points[0].noise)
+    for left, right in zip(points, points[1:]):
+        if left.ts <= ts <= right.ts:
+            return max(0.0, left.noise)
+    return max(0.0, points[-1].noise)
 
 
 def add_noise(value: float, amplitude: float, rng: random.Random) -> float:
@@ -93,7 +109,10 @@ def emit_due(storage, *, now: float, rng: random.Random | None = None, quality: 
         except ValueError:
             continue
         base = interpolate(schedule.keyframes, now)
-        noisy = add_noise(base, schedule.noise, generator)
+        amplitude = noise_at(schedule.keyframes, now)
+        if amplitude <= 0 and schedule.noise > 0:
+            amplitude = schedule.noise
+        noisy = add_noise(base, amplitude, generator)
         try:
             value = quantize(kind, noisy)
         except ValueError:

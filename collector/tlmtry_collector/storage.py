@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS virtual_keyframes (
     metric_id INTEGER NOT NULL,
     ts REAL NOT NULL,
     value REAL NOT NULL,
+    noise REAL NOT NULL DEFAULT 0,
     PRIMARY KEY (address, metric_id, ts)
 );
 """
@@ -141,6 +142,7 @@ CREATE TABLE IF NOT EXISTS virtual_keyframes (
     metric_id INTEGER NOT NULL,
     ts DOUBLE PRECISION NOT NULL,
     value DOUBLE PRECISION NOT NULL,
+    noise DOUBLE PRECISION NOT NULL DEFAULT 0,
     PRIMARY KEY (address, metric_id, ts)
 );
 """
@@ -218,6 +220,7 @@ class Storage:
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SQLITE_SCHEMA)
         self._conn.commit()
+        self._migrate_keyframe_noise()
 
     def _init_postgres(self, dsn: str) -> None:
         try:
@@ -237,6 +240,57 @@ class Storage:
         with self._conn.cursor() as cur:
             for statement in statements:
                 cur.execute(statement)
+        self._conn.commit()
+        self._migrate_keyframe_noise()
+
+    def _migrate_keyframe_noise(self) -> None:
+        """Add per-keyframe noise on older databases and seed from schedule noise."""
+        if self.backend == "sqlite":
+            cols = {
+                row[1]
+                for row in self._conn.execute("PRAGMA table_info(virtual_keyframes)")
+            }
+            if "noise" in cols:
+                return
+            self._conn.execute(
+                "ALTER TABLE virtual_keyframes ADD COLUMN noise REAL NOT NULL DEFAULT 0"
+            )
+            self._conn.execute(
+                """
+                UPDATE virtual_keyframes
+                SET noise = COALESCE(
+                    (
+                        SELECT noise FROM virtual_schedules AS s
+                        WHERE s.address = virtual_keyframes.address
+                          AND s.metric_id = virtual_keyframes.metric_id
+                    ),
+                    0
+                )
+                """
+            )
+            self._conn.commit()
+            return
+
+        row = self._fetchone(
+            """
+            SELECT 1 AS ok
+            FROM information_schema.columns
+            WHERE table_name = 'virtual_keyframes' AND column_name = 'noise'
+            """
+        )
+        if row is not None:
+            return
+        self._execute(
+            "ALTER TABLE virtual_keyframes ADD COLUMN noise DOUBLE PRECISION NOT NULL DEFAULT 0"
+        )
+        self._execute(
+            """
+            UPDATE virtual_keyframes AS k
+            SET noise = s.noise
+            FROM virtual_schedules AS s
+            WHERE s.address = k.address AND s.metric_id = k.metric_id
+            """
+        )
         self._conn.commit()
 
     @property
@@ -644,10 +698,16 @@ class Storage:
             for point in points:
                 self._execute(
                     """
-                    INSERT INTO virtual_keyframes(address, metric_id, ts, value)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO virtual_keyframes(address, metric_id, ts, value, noise)
+                    VALUES (?, ?, ?, ?, ?)
                     """,
-                    (schedule.address, schedule.metric_id, point.ts, point.value),
+                    (
+                        schedule.address,
+                        schedule.metric_id,
+                        point.ts,
+                        point.value,
+                        float(max(0.0, point.noise)),
+                    ),
                 )
 
     def delete_schedule(self, address: int, metric_id: int) -> None:
@@ -681,7 +741,7 @@ class Storage:
         )
         points = self._fetchall(
             """
-            SELECT address, metric_id, ts, value
+            SELECT address, metric_id, ts, value, noise
             FROM virtual_keyframes
             ORDER BY ts
             """
@@ -696,6 +756,7 @@ class Storage:
                 Keyframe(
                     ts=float(self._row_get(point, "ts")),
                     value=float(self._row_get(point, "value")),
+                    noise=float(self._row_get(point, "noise")),
                 )
             )
         schedules: list[VirtualSchedule] = []
